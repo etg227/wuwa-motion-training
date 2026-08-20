@@ -2,3 +2,7 @@ numpy>=2.0
 opencv-python>=4.10
 torch>=2.4
 torchvision>=0.19
+mss>=10.0
+pynput>=1.7
+psutil>=6.0
+pywin32>=306; platform_system == "Windows"
