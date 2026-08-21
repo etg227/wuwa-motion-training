@@ -69,4 +69,4 @@ tests/TestLiveReadyProbe.py
 
 ## 许可证与来源
 
-训练代码来自 `wuwa-yg-launcher` 的 AGPL-3.0 代码历史，本仓库继续按 GNU Affero General Public License v3.0 使用。原项目基础来自 OK-WW / OK-Script；具体来源与致谢以 `wuwa-yg-launcher` 项目说明为准。
+训练代码来自 `wuwa-yg-launcher` 的 AGPL-3.0 代码历史，本仓库继续按 GNU Affero General Public License v3.0 使用（见 `LICENSE.txt`）。原项目基础来自 OK-WW / OK-Script；具体来源与致谢以 `wuwa-yg-launcher` 项目说明为准。

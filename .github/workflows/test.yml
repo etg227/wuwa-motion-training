@@ -1,0 +1,35 @@
+name: Run Tests
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint and unit tests (3.12)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      # 只装轻量单元测试所需依赖。完整训练依赖（torch/cv2/mss 等）见
+      # training/motion/requirements.txt，训练与实机 probe 不在 CI 覆盖范围。
+      - name: Install test dependencies
+        run: pip install numpy ruff
+
+      - name: Lint critical errors
+        run: ruff check .
+
+      - name: Run unit tests
+        run: python -m unittest discover tests -p "Test*.py" -v
