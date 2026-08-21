@@ -20,7 +20,9 @@ class ReadyWindowGate:
     - a high READY island can trigger at most once;
     - blocked/uncertain high islands are consumed instead of triggering late;
     - re-arming requires several clearly-low READY frames;
-    - a motion-mode change must pass through a low region before it may trigger.
+    - a motion-mode change does not by itself arm or disarm the gate. The current
+      armed/disarmed state is preserved so a one-frame classifier mode change
+      cannot swallow a valid READY island or create a duplicate trigger.
     """
 
     def __init__(
@@ -64,8 +66,11 @@ class ReadyWindowGate:
         if initial_mode:
             self.mode_id = mode_id
         elif mode_changed:
+            # Raw mode classification can flicker for a frame around visual
+            # transitions. Preserve armed/disarmed state across that flicker.
+            # Clear only the partial low streak so low evidence from two
+            # different mode profiles cannot combine to re-arm a consumed island.
             self.mode_id = mode_id
-            self.armed = False
             self.low_streak = 0
 
         rearmed = False
@@ -104,10 +109,10 @@ class ReadyWindowGate:
                 reason=reason,
             )
 
-        if mode_changed:
-            reason = "mode_changed_wait_low"
-        elif rearmed:
+        if rearmed:
             reason = "rearmed"
+        elif mode_changed:
+            reason = "mode_changed_preserve_gate"
         elif self.armed:
             reason = "armed_wait_high"
         else:

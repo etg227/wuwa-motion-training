@@ -30,18 +30,36 @@ class TestLiveReadyProbeGate(unittest.TestCase):
         later = gate.update(0, 0.95, 1.1, can_trigger=True)
         self.assertFalse(later.trigger)
 
-    def test_mode_change_requires_low_rearm_before_trigger(self):
+    def test_mode_change_preserves_armed_gate_and_can_trigger(self):
+        gate = ReadyWindowGate(rearm_frames=2)
+        self.assertFalse(gate.update(0, 0.05, 1.0).trigger)
+        switched = gate.update(1, 0.95, 1.1)
+        self.assertTrue(switched.mode_changed)
+        self.assertTrue(switched.trigger)
+        self.assertFalse(switched.armed)
+
+    def test_mode_change_does_not_rearm_consumed_window(self):
         gate = ReadyWindowGate(rearm_frames=2)
         self.assertTrue(gate.update(0, 0.90, 1.0).trigger)
-        gate.update(0, 0.05, 1.1)
-        gate.update(0, 0.05, 1.2)
-        switched = gate.update(1, 0.95, 1.3)
-        self.assertFalse(switched.trigger)
-        self.assertTrue(switched.mode_changed)
-        gate.update(1, 0.05, 1.4)
-        low2 = gate.update(1, 0.05, 1.5)
+        switched_high = gate.update(1, 0.95, 1.1)
+        self.assertTrue(switched_high.mode_changed)
+        self.assertFalse(switched_high.trigger)
+        self.assertFalse(switched_high.armed)
+        gate.update(1, 0.05, 1.2)
+        low2 = gate.update(1, 0.05, 1.3)
         self.assertTrue(low2.rearmed)
-        self.assertTrue(gate.update(1, 0.90, 1.6).trigger)
+        self.assertTrue(gate.update(1, 0.90, 1.4).trigger)
+
+    def test_low_streak_does_not_cross_mode_boundary(self):
+        gate = ReadyWindowGate(rearm_frames=2)
+        self.assertTrue(gate.update(0, 0.90, 1.0).trigger)
+        first_low = gate.update(0, 0.05, 1.1)
+        self.assertFalse(first_low.armed)
+        switched_low = gate.update(1, 0.05, 1.2)
+        self.assertTrue(switched_low.mode_changed)
+        self.assertFalse(switched_low.armed)
+        next_low = gate.update(1, 0.05, 1.3)
+        self.assertTrue(next_low.rearmed)
 
     def test_cooldown_high_island_is_consumed(self):
         gate = ReadyWindowGate(min_trigger_interval_s=0.50, rearm_frames=1)
