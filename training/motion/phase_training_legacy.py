@@ -45,9 +45,11 @@ class CycleWindowDataset(Dataset):
                 length = len(data["frames"])
             for end in range(0, length, max(1, stride)):
                 self.samples.append((cycle_index, end))
+        # 缓存绑定到实例：类级 @lru_cache 会持有 self（连带全部帧数组），
+        # 让多轮训练创建的数据集对象永远无法回收。
+        self._load = lru_cache(maxsize=12)(self._load_uncached)
 
-    @lru_cache(maxsize=12)
-    def _load(self, cycle_index):
+    def _load_uncached(self, cycle_index):
         item = self.items[cycle_index]
         with np.load(self.root / item["cycle"]) as data:
             return data["frames"].copy(), data["phases"].copy()
@@ -84,9 +86,10 @@ class ModeWindowDataset(Dataset):
             effective_stride = max(2, stride)
             for end in range(0, length, effective_stride):
                 self.samples.append((cycle_index, end))
+        # 同 CycleWindowDataset：缓存必须随实例回收。
+        self._load_frames = lru_cache(maxsize=16)(self._load_frames_uncached)
 
-    @lru_cache(maxsize=16)
-    def _load_frames(self, cycle_index):
+    def _load_frames_uncached(self, cycle_index):
         with np.load(self.root / self.items[cycle_index]["cycle"]) as data:
             return data["frames"].copy()
 

@@ -1,5 +1,26 @@
 # Character Motion Cycle Dataset
 
+> [!NOTE]
+> **拆库建议**：`training/` 已增长到约 7000 行，依赖（torch / mss / pynput /
+> tkinter）与启动器完全独立，也不在 `deploy.txt` 分发清单和 CI 覆盖范围内，
+> 建议迁入独立仓库。目录布局（`training/motion/` + `training_data/`）设计为
+> 可整体平移——在新仓库根目录保持同样的相对路径即可，`common.py` 的
+> `ROOT`/`DATA_ROOT` 与 `auto_train.py` 的子进程调用无需任何修改。迁移命令：
+>
+> ```powershell
+> # 在 GitHub 上新建空仓库 <owner>/wuwa-motion-training 后（保留原路径深度与历史）：
+> git clone https://github.com/<owner>/wuwa-yg-launcher.git motion-split
+> cd motion-split
+> py -3.12 -m pip install git-filter-repo
+> git filter-repo --path training/ --path tests/TestPhaseTracker.py --path tests/TestReadyEvidence.py
+> git remote add origin https://github.com/<owner>/wuwa-motion-training.git
+> git push -u origin main
+> # 确认新仓库可用后，再在本仓库删除 training/ 与上述两个测试文件。
+> ```
+>
+> 注意保留 `training/motion/` 的目录深度（不要把 `motion/` 提升到仓库根），
+> 否则 `common.py` 的 `ROOT = parents[2]` 会指向仓库外。
+
 这个实验训练集用于从连续游戏视频学习角色的**整套平A循环相位**，而不是预先规定角色有 3 段、4 段或 5 段平A。
 
 核心假设非常简单：连续平A时，只要某个可辨认动作/姿态再次出现，就说明完整平A循环经过了一轮。相邻两个“相同姿态”边界之间就是一个 `cycle`。
