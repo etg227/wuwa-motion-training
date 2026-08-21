@@ -224,18 +224,22 @@ def _fixed_probe_split(members, remove_indexes: set[int], seed: int):
     return baseline_train, removed_train, sorted(val_indexes)
 
 
-def _probe_error(root: Path, train_items, val_items, args, device, seed: int, epochs: int):
+def _probe_error(root: Path, train_items, val_items, args, device, seed: int, epochs: int,
+                 dataset_cls=None):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+    # 与正式训练共用同一个 dataset_cls（例如相位对齐数据集），保证 leave-out
+    # 质检和正式训练看到一致的目标标签；显式传参取代旧版的模块级猴补丁。
+    dataset_cls = dataset_cls or core.CycleWindowDataset
     stride = max(3, int(args.stride))
-    train_ds = core.CycleWindowDataset(
+    train_ds = dataset_cls(
         root, train_items, args.window, stride, augment=False
     )
-    val_ds = core.CycleWindowDataset(
+    val_ds = dataset_cls(
         root, val_items, args.window, stride, augment=False
     )
     if len(train_ds) == 0 or len(val_ds) == 0:
@@ -275,7 +279,8 @@ def _probe_error(root: Path, train_items, val_items, args, device, seed: int, ep
     return core.evaluate_phase(model, val_loader, device)
 
 
-def _probe_removal(root: Path, members, removal: set[int], args, device, seed: int):
+def _probe_removal(root: Path, members, removal: set[int], args, device, seed: int,
+                   dataset_cls=None):
     split = _fixed_probe_split(members, removal, seed)
     if split is None:
         return None
@@ -292,6 +297,7 @@ def _probe_removal(root: Path, members, removal: set[int], args, device, seed: i
         device,
         seed,
         args.outlier_probe_epochs,
+        dataset_cls=dataset_cls,
     )
     removed = _probe_error(
         root,
@@ -301,6 +307,7 @@ def _probe_removal(root: Path, members, removal: set[int], args, device, seed: i
         device,
         seed,
         args.outlier_probe_epochs,
+        dataset_cls=dataset_cls,
     )
     if not np.isfinite(baseline) or not np.isfinite(removed):
         return None
@@ -363,7 +370,7 @@ def _candidate_groups(members, scores, max_remove: int, max_probes: int, score_t
     return ordered[:max_probes]
 
 
-def filter_mode_cycles(root: Path, members, args, device, mode_name: str):
+def filter_mode_cycles(root: Path, members, args, device, mode_name: str, dataset_cls=None):
     if len(members) < 5:
         return list(members), [], {
             "mode": mode_name,
@@ -403,7 +410,8 @@ def filter_mode_cycles(root: Path, members, args, device, mode_name: str):
         if len(indexes) > max_remove:
             continue
         seed = args.seed + 5000 + probe_index * 97 + len(members)
-        result = _probe_removal(root, members, indexes, args, device, seed)
+        result = _probe_removal(root, members, indexes, args, device, seed,
+                                dataset_cls=dataset_cls)
         if result is None:
             continue
         median_score = float(np.median([

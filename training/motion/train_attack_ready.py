@@ -270,12 +270,9 @@ def _mode_profile(root: Path, meta: dict, items: list[dict], cache: dict) -> dic
 
 
 def train_character_attack_ready(character: str) -> dict:
-    original = legacy._mode_profile
-    legacy._mode_profile = _mode_profile
-    try:
-        return legacy.train_character_attack_ready(character)
-    finally:
-        legacy._mode_profile = original
+    # 本模块的 _mode_profile 在 legacy 版本上叠加了因果证据累积；
+    # 通过参数显式注入，不再运行时替换 legacy 模块属性。
+    return legacy.train_character_attack_ready(character, mode_profile=_mode_profile)
 
 
 def main() -> int:

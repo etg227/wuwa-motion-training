@@ -365,7 +365,10 @@ def _quarantine_previous(formal: Path) -> None:
     print(f"quarantined previous ATTACK READY model -> {target}")
 
 
-def train_character_attack_ready(character: str) -> dict:
+def train_character_attack_ready(character: str, mode_profile=None) -> dict:
+    # mode_profile 由调用方显式注入（train_attack_ready 传带因果证据版本），
+    # 取代旧版对本模块 _mode_profile 属性的运行时替换。
+    mode_profile = mode_profile or _mode_profile
     root = character_root(character)
     index_path = root / "modes" / "index.json"
     if not index_path.is_file():
@@ -389,7 +392,7 @@ def train_character_attack_ready(character: str) -> dict:
 
     cache, profiles, accepted_rows = {}, [], []
     for meta in mode_index.get("modes", []):
-        profile = _mode_profile(root, meta, _load_jsonl(_mode_manifest(root, meta)), cache)
+        profile = mode_profile(root, meta, _load_jsonl(_mode_manifest(root, meta)), cache)
         profiles.append(profile)
         accepted_rows.extend({
             **row, "mode_id": profile["id"], "stable_id": profile.get("stable_id")
