@@ -19,7 +19,8 @@
 
 ```text
 training/motion/       训练、推理与验证代码
-tests/                 训练模块相关测试
+training/axis/         UP 视频轴提取：逐帧标注 + 编译成宏/轴节点表
+tests/                 训练与轴提取模块的测试
 training_data/motion/  本地视频、telemetry、cycle、模型与 replay（Git 忽略）
 ```
 
