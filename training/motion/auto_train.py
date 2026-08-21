@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import queue
 import subprocess
@@ -26,6 +27,61 @@ from common import DATA_ROOT, ROOT, character_root, safe_character, write_json
 GAME_PROCESS = "client-win64-shipping.exe"
 CAPTURE_FPS = 30.0
 TRAIN_EPOCHS = 30
+XINPUT_POLL_HZ = 240.0
+XINPUT_GAMEPAD_TRIGGER_THRESHOLD = 30
+
+
+class XInputGamepad(ctypes.Structure):
+    _fields_ = [
+        ("wButtons", ctypes.c_ushort),
+        ("bLeftTrigger", ctypes.c_ubyte),
+        ("bRightTrigger", ctypes.c_ubyte),
+        ("sThumbLX", ctypes.c_short),
+        ("sThumbLY", ctypes.c_short),
+        ("sThumbRX", ctypes.c_short),
+        ("sThumbRY", ctypes.c_short),
+    ]
+
+
+class XInputState(ctypes.Structure):
+    _fields_ = [
+        ("dwPacketNumber", ctypes.c_ulong),
+        ("Gamepad", XInputGamepad),
+    ]
+
+
+XINPUT_BUTTONS = (
+    (0x0001, "dpad_up"),
+    (0x0002, "dpad_down"),
+    (0x0004, "dpad_left"),
+    (0x0008, "dpad_right"),
+    (0x0010, "start"),
+    (0x0020, "back"),
+    (0x0040, "left_thumb"),
+    (0x0080, "right_thumb"),
+    (0x0100, "lb"),
+    (0x0200, "rb"),
+    (0x1000, "a"),
+    (0x2000, "b"),
+    (0x4000, "x"),
+    (0x8000, "y"),
+)
+
+
+def _load_xinput():
+    for dll_name in ("xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"):
+        try:
+            dll = ctypes.WinDLL(dll_name)
+            get_state = dll.XInputGetState
+            get_state.argtypes = [ctypes.c_ulong, ctypes.POINTER(XInputState)]
+            get_state.restype = ctypes.c_ulong
+            return get_state, dll_name
+        except (OSError, AttributeError):
+            continue
+    return None, None
+
+
+XINPUT_GET_STATE, XINPUT_DLL_NAME = _load_xinput() if sys.platform == "win32" else (None, None)
 
 
 def _process_name_from_hwnd(hwnd: int) -> str:
@@ -82,6 +138,14 @@ def _key_name(key) -> str:
         return str(key)
 
 
+def _xinput_digital_state(state: XInputState) -> dict[str, bool]:
+    buttons = int(state.Gamepad.wButtons)
+    result = {name: bool(buttons & mask) for mask, name in XINPUT_BUTTONS}
+    result["lt"] = int(state.Gamepad.bLeftTrigger) >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD
+    result["rt"] = int(state.Gamepad.bRightTrigger) >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD
+    return result
+
+
 class RecordingSession:
     def __init__(self, character: str, log):
         self.character = safe_character(character)
@@ -94,6 +158,7 @@ class RecordingSession:
 
         self.stop_event = threading.Event()
         self.capture_thread: threading.Thread | None = None
+        self.gamepad_thread: threading.Thread | None = None
         self.keyboard_listener = None
         self.mouse_listener = None
         self.hwnd = 0
@@ -106,6 +171,7 @@ class RecordingSession:
         self.error: Exception | None = None
         self.width = 0
         self.height = 0
+        self.connected_gamepads: set[int] = set()
 
     def _game_foreground(self) -> bool:
         return bool(self.hwnd and win32gui.GetForegroundWindow() == self.hwnd)
@@ -134,6 +200,44 @@ class RecordingSession:
         name = getattr(button, "name", str(button))
         self._append_input("mouse", name, "down" if pressed else "up")
 
+    def _gamepad_loop(self):
+        if XINPUT_GET_STATE is None:
+            self.log("未找到 XInput DLL；本次只记录键盘/鼠标输入。")
+            return
+
+        previous: dict[int, dict[str, bool]] = {}
+        interval = 1.0 / XINPUT_POLL_HZ
+        while not self.stop_event.is_set():
+            loop_start = time.monotonic()
+            for index in range(4):
+                state = XInputState()
+                result = int(XINPUT_GET_STATE(index, ctypes.byref(state)))
+                if result != 0:
+                    previous.pop(index, None)
+                    continue
+
+                if index not in self.connected_gamepads:
+                    self.connected_gamepads.add(index)
+                    self.log(f"检测到 XInput 手柄 #{index + 1}（{XINPUT_DLL_NAME}）")
+
+                current = _xinput_digital_state(state)
+                prior = previous.get(index)
+                if prior is not None and self._game_foreground() and self.first_frame_at > 0:
+                    for code, pressed in current.items():
+                        old_pressed = prior.get(code, False)
+                        if pressed == old_pressed:
+                            continue
+                        self._append_input(
+                            f"gamepad{index}",
+                            code,
+                            "down" if pressed else "up",
+                        )
+                previous[index] = current
+
+            remaining = interval - (time.monotonic() - loop_start)
+            if remaining > 0:
+                time.sleep(remaining)
+
     def start(self):
         self.hwnd = find_game_window()
         if not self.hwnd:
@@ -150,6 +254,8 @@ class RecordingSession:
         self.keyboard_listener.start()
         self.mouse_listener.start()
 
+        self.gamepad_thread = threading.Thread(target=self._gamepad_loop, daemon=True)
+        self.gamepad_thread.start()
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.capture_thread.start()
 
@@ -230,6 +336,8 @@ class RecordingSession:
         self.stop_event.set()
         if self.capture_thread is not None:
             self.capture_thread.join(timeout=5)
+        if self.gamepad_thread is not None:
+            self.gamepad_thread.join(timeout=2)
 
         for listener in (self.keyboard_listener, self.mouse_listener):
             if listener is not None:
@@ -243,8 +351,13 @@ class RecordingSession:
             for item in events:
                 stream.write(json.dumps(item, ensure_ascii=False) + "\n")
 
+        device_counts: dict[str, int] = {}
+        for item in events:
+            device = str(item["device"])
+            device_counts[device] = device_counts.get(device, 0) + 1
+
         session = {
-            "schema": 1,
+            "schema": 2,
             "character": self.character,
             "video": str(self.video_path.resolve()),
             "input_log": str(self.telemetry_path.resolve()),
@@ -253,6 +366,9 @@ class RecordingSession:
             "width": self.width,
             "height": self.height,
             "input_events": len(events),
+            "input_events_by_device": device_counts,
+            "xinput_dll": XINPUT_DLL_NAME,
+            "xinput_gamepads": sorted(self.connected_gamepads),
             "foreground_only": True,
         }
         write_json(self.session_path, session)
@@ -388,9 +504,13 @@ class AutoTrainerApp:
             self.status_var.set("录像未进入训练")
             return
 
+        with session.telemetry_lock:
+            gamepad_events = sum(
+                1 for item in session.telemetry if str(item.get("device", "")).startswith("gamepad")
+            )
         self.log(
             f"录像完成：{video.name}，有效帧={session.frame_count}，"
-            f"自动记录输入事件={len(session.telemetry)}"
+            f"自动记录输入事件={len(session.telemetry)}（手柄={gamepad_events}）"
         )
         self.status_var.set("自动分析/训练中")
         self.pipeline_thread = threading.Thread(
