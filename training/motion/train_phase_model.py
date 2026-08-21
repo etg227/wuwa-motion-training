@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from stable_phase_training_v3 import main as train_phase_main
+from phase_training import main as train_phase_main
 from train_attack_ready import train_character_attack_ready
 
 

@@ -466,14 +466,18 @@ def _split_phase_items(items, seed: int):
     return shuffled[val_count:], shuffled[:val_count]
 
 
-def train_phase_model(root: Path, items, args, device, model_path: Path, mode_name: str):
+def train_phase_model(root: Path, items, args, device, model_path: Path, mode_name: str,
+                      dataset_cls=None):
     if len(items) < 3:
         raise RuntimeError(f"{mode_name} 只有 {len(items)} 个 cycle，至少需要 3 个。")
 
+    # dataset_cls 由调用方显式传入（例如相位对齐训练传 AlignedCycleWindowDataset），
+    # 取代旧版对模块属性的运行时猴补丁。
+    dataset_cls = dataset_cls or CycleWindowDataset
     mode_seed = args.seed + sum((index + 1) * ord(char) for index, char in enumerate(mode_name))
     train_items, val_items = _split_phase_items(items, mode_seed)
-    train_ds = CycleWindowDataset(root, train_items, args.window, args.stride, augment=True)
-    val_ds = CycleWindowDataset(root, val_items, args.window, args.stride, augment=False)
+    train_ds = dataset_cls(root, train_items, args.window, args.stride, augment=True)
+    val_ds = dataset_cls(root, val_items, args.window, args.stride, augment=False)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
