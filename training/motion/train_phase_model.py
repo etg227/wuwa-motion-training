@@ -1,4 +1,4 @@
-from stable_phase_training_v2 import *  # noqa: F401,F403
+from stable_phase_training_v3 import *  # noqa: F401,F403
 
 
 if __name__ == "__main__":
