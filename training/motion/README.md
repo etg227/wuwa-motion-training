@@ -12,10 +12,13 @@
 > git clone https://github.com/<owner>/wuwa-yg-launcher.git motion-split
 > cd motion-split
 > py -3.12 -m pip install git-filter-repo
-> git filter-repo --path training/ --path tests/TestPhaseTracker.py --path tests/TestReadyEvidence.py
+> git filter-repo --path training/ `
+>   --path tests/TestPhaseTracker.py `
+>   --path tests/TestReadyEvidence.py `
+>   --path tests/TestLiveReadyProbe.py
 > git remote add origin https://github.com/<owner>/wuwa-motion-training.git
 > git push -u origin main
-> # 确认新仓库可用后，再在本仓库删除 training/ 与上述两个测试文件。
+> # 确认新仓库可用后，再在本仓库删除 training/ 与上述三个测试文件。
 > ```
 >
 > 注意保留 `training/motion/` 的目录深度（不要把 `motion/` 提升到仓库根），
