@@ -5,6 +5,8 @@ import bisect
 import math
 from pathlib import Path
 
+import numpy as np
+
 import attack_ready_legacy as legacy
 from semantic_inputs import telemetry_path_for_video
 
@@ -18,6 +20,80 @@ def _cycle_has_attack(item: dict, cache: dict) -> bool:
     end = int(item["end_frame"])
     index = bisect.bisect_left(frames, start)
     return index < len(frames) and int(frames[index]) < end
+
+
+def _short_signed_delta(later: float, earlier: float) -> float:
+    """Shortest signed circular delta from earlier -> later in [-0.5, 0.5)."""
+    return float(((later - earlier + 0.5) % 1.0) - 0.5)
+
+
+def _causal_phase_lead(transition: float, event_phase: float) -> float:
+    """How far an input precedes a visual transition on the short circular arc.
+
+    Video/input timestamps are quantized to frames. If the input lands one frame
+    after the visual transition, treat that small negative delta as 0 rather than
+    wrapping it to ~1.0 cycle.
+    """
+    return max(0.0, _short_signed_delta(transition, event_phase))
+
+
+def _window(candidate: dict, samples: list[dict], cycle_count: int) -> dict | None:
+    if not samples:
+        return None
+
+    transition = legacy._anchored_median(
+        [row["transition_phase"] for row in samples], candidate["phase"]
+    )
+    spread = float(np.median([
+        legacy._circ_dist(row["transition_phase"], transition) for row in samples
+    ]))
+
+    # IMPORTANT: do not use `(transition - event) % 1.0` here. Around phase 0,
+    # a harmless -1 frame timestamp ordering would become ~0.98 and create a
+    # READY window spanning almost the entire combo cycle.
+    accepted_leads = [
+        _causal_phase_lead(row["transition_phase"], row["accepted_phase"])
+        for row in samples
+    ]
+    opening_leads = [
+        _causal_phase_lead(row["transition_phase"], row["opening_phase"])
+        for row in samples
+    ]
+    accepted_lead = float(np.median(accepted_leads))
+    opening_lead = float(np.median(opening_leads))
+
+    # The opening bound must precede the accepted point by at least one small
+    # phase bin so the probability curve has a finite ramp even when input and
+    # transition are recorded in the same 30-FPS frame.
+    opening_lead = max(opening_lead, accepted_lead + 0.008)
+
+    lead_ms = np.asarray([row["lead_ms"] for row in samples], dtype=np.float32)
+    lead_mad = float(np.median(np.abs(lead_ms - np.median(lead_ms))))
+    bounded = sum(row["previous_attack_frame"] is not None for row in samples)
+    support = len(samples) / max(1, cycle_count)
+    prominence = candidate["prominence"] / max(candidate["value"], 1e-5)
+    confidence = (
+        0.42 * min(1.0, support)
+        + 0.22 * min(1.0, prominence * 3.0)
+        + 0.18 * max(0.0, 1.0 - spread / 0.055)
+        + 0.10 * max(0.0, 1.0 - lead_mad / 115.0)
+        + 0.08 * bounded / max(1, len(samples))
+    )
+
+    return {
+        "start_phase": float((transition - opening_lead) % 1.0),
+        "accepted_phase": float((transition - accepted_lead) % 1.0),
+        "transition_phase": float(transition),
+        "support_cycles": len(samples),
+        "total_cycles": cycle_count,
+        "support_ratio": float(support),
+        "median_lead_ms": float(np.median(lead_ms)),
+        "lead_mad_ms": lead_mad,
+        "transition_spread": spread,
+        "confidence": float(np.clip(confidence, 0.0, 1.0)),
+        "samples": samples,
+        "lead_aggregation": "short-signed-causal-v2",
+    }
 
 
 def _mode_profile(root: Path, meta: dict, items: list[dict], cache: dict) -> dict:
@@ -43,7 +119,7 @@ def _mode_profile(root: Path, meta: dict, items: list[dict], cache: dict) -> dic
         ]
         if len(samples) < minimum_support:
             continue
-        window = legacy._window(candidate, samples, len(usable))
+        window = _window(candidate, samples, len(usable))
         if window is None:
             continue
         if window["transition_spread"] > 0.060:
