@@ -12,7 +12,6 @@ import numpy as np
 import pydirectinput
 import torch
 import win32gui
-from pynput import keyboard
 
 import replay_validate as replay
 from auto_train import GAME_PROCESS, find_game_window, game_client_rect
@@ -104,7 +103,7 @@ class LiveMotionRuntime:
 
 
 class BurstExecutor:
-    """Short PyDirect mouse burst with foreground and emergency-stop checks."""
+    """Short PyDirect mouse burst with foreground and stop checks."""
 
     def __init__(
         self,
@@ -128,6 +127,7 @@ class BurstExecutor:
         self._busy = False
         self._mouse_down = False
         pydirectinput.PAUSE = 0
+        pydirectinput.FAILSAFE = False
 
     @property
     def busy(self) -> bool:
@@ -231,6 +231,26 @@ def _capture_client(screen: mss.mss, hwnd: int) -> np.ndarray | None:
     return np.ascontiguousarray(frame)
 
 
+def _wait_for_enter_and_delay(delay_s: float) -> None:
+    delay_s = max(0.0, float(delay_s))
+    input(
+        "按 Enter 准备开始；按下后请立刻 Alt+Tab 回鸣潮，"
+        f"{delay_s:.0f} 秒后自动启动 READY probe..."
+    )
+    deadline = time.monotonic() + delay_s
+    last_second = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        second = max(1, int(remaining + 0.999))
+        if second != last_second:
+            print(f"[START] {second}...")
+            last_second = second
+        time.sleep(min(0.05, remaining))
+    print("[START] GO - READY probe 已启动；手动左键一次开始第一段普攻后松手。")
+
+
 def main() -> int:
     if sys.platform != "win32":
         raise SystemExit("live_ready_probe.py 仅支持 Windows。")
@@ -254,6 +274,7 @@ def main() -> int:
     parser.add_argument("--between-click-ms", type=float, default=45.0)
     parser.add_argument("--max-triggers", type=int, default=12)
     parser.add_argument("--status-ms", type=float, default=500.0)
+    parser.add_argument("--start-delay", type=float, default=5.0)
     parser.add_argument(
         "--roi",
         nargs=4,
@@ -276,6 +297,7 @@ def main() -> int:
     )
     args.max_triggers = max(1, int(args.max_triggers))
     args.status_ms = max(100.0, float(args.status_ms))
+    args.start_delay = max(0.0, float(args.start_delay))
 
     if args.rearm_threshold >= args.ready_threshold:
         raise SystemExit("--rearm-threshold 必须小于 --ready-threshold")
@@ -292,7 +314,6 @@ def main() -> int:
 
     stop_event = threading.Event()
     enabled_event = threading.Event()
-    reset_requested = threading.Event()
     foreground_state = {"hwnd": 0}
 
     def foreground_check() -> bool:
@@ -313,45 +334,6 @@ def main() -> int:
         dry_run=args.dry_run,
     )
 
-    hotkey_lock = threading.Lock()
-    hotkeys_down: set[object] = set()
-
-    def on_key_press(key):
-        with hotkey_lock:
-            if key in hotkeys_down:
-                return
-            if key in (keyboard.Key.f8, keyboard.Key.f9):
-                hotkeys_down.add(key)
-
-        if key == keyboard.Key.f8:
-            if enabled_event.is_set():
-                enabled_event.clear()
-                executor.release()
-                print("[F8] probe DISARMED")
-            else:
-                enabled_event.set()
-                print(
-                    "[F8] probe ARMED - 手动左键启动第一段普攻后松手；"
-                    "后续 READY window 将尝试短 burst"
-                )
-            reset_requested.set()
-        elif key == keyboard.Key.f9:
-            enabled_event.clear()
-            stop_event.set()
-            executor.release()
-            print("[F9] EMERGENCY STOP")
-            return False
-
-    def on_key_release(key):
-        with hotkey_lock:
-            hotkeys_down.discard(key)
-
-    listener = keyboard.Listener(
-        on_press=on_key_press,
-        on_release=on_key_release,
-    )
-    listener.start()
-
     print(
         f"character={args.character} device={device} target_fps={args.fps:.1f} "
         f"raw_READY>={args.ready_threshold:.2f}"
@@ -361,8 +343,17 @@ def main() -> int:
         f"gap={args.between_click_ms:.0f}ms max_triggers={args.max_triggers} "
         f"{'(DRY RUN)' if args.dry_run else '(LIVE INPUT)'}"
     )
-    print("F8 = arm/disarm   F9 = emergency stop")
-    print(f"等待 {GAME_PROCESS} 游戏窗口；输入默认处于 DISARMED。")
+    print("Enter = 5 秒后启动   Ctrl+C = stop")
+
+    try:
+        _wait_for_enter_and_delay(args.start_delay)
+    except (EOFError, KeyboardInterrupt):
+        print("[CANCEL] 未启动 READY probe")
+        return 0
+
+    runtime.reset()
+    gate.reset()
+    enabled_event.set()
 
     trigger_count = 0
     auto_disarm_pending = False
@@ -374,13 +365,6 @@ def main() -> int:
     try:
         with mss.mss() as screen:
             while not stop_event.is_set():
-                if reset_requested.is_set():
-                    runtime.reset()
-                    gate.reset()
-                    trigger_count = 0
-                    auto_disarm_pending = False
-                    reset_requested.clear()
-
                 hwnd = int(foreground_state["hwnd"])
                 if not hwnd or not win32gui.IsWindow(hwnd):
                     hwnd = find_game_window()
@@ -497,7 +481,6 @@ def main() -> int:
         enabled_event.clear()
         stop_event.set()
         executor.release()
-        listener.stop()
 
     return 0
 
