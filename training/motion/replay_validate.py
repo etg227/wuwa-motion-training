@@ -19,6 +19,7 @@ from semantic_inputs import load_semantic_events, telemetry_path_for_video
 
 DEFAULT_READY_THRESHOLD = 0.85
 DEFAULT_BATCH_SIZE = 48
+ACCEPTED_DIAGNOSTIC_RADIUS = 2
 
 
 def _path_key(path: Path | str) -> str:
@@ -326,6 +327,53 @@ def _accepted_frames(root: Path, video: Path) -> set[int]:
     }
 
 
+def _accepted_diagnostics(
+    predictions: list[dict],
+    accepted: set[int],
+    expected_mode: np.ndarray,
+    expected_phase: np.ndarray,
+    ready_profiles: dict[int, dict],
+    radius: int = ACCEPTED_DIAGNOSTIC_RADIUS,
+) -> dict:
+    rows = []
+    frame_count = len(predictions)
+    for frame in sorted(accepted):
+        if frame < 0 or frame >= frame_count:
+            continue
+        prediction = predictions[frame]
+        pred_mode = int(prediction["mode"])
+        pred_phase = float(prediction["phase"])
+        exp_mode = int(expected_mode[frame])
+        exp_phase = (
+            float(expected_phase[frame])
+            if np.isfinite(expected_phase[frame])
+            else None
+        )
+        expected_ready = None
+        mode_match = None
+        phase_error = None
+        if exp_mode >= 0:
+            mode_match = pred_mode == exp_mode
+            if exp_phase is not None:
+                expected_ready = _ready_probability(ready_profiles.get(exp_mode), exp_phase)
+                if mode_match:
+                    phase_error = _circular_error(pred_phase, exp_phase)
+        left = max(0, frame - radius)
+        right = min(frame_count, frame + radius + 1)
+        nearby_max = max(float(predictions[index]["chain_ready"]) for index in range(left, right))
+        rows.append(
+            {
+                "frame": frame,
+                "predicted_ready": float(prediction["chain_ready"]),
+                "expected_phase_ready": expected_ready,
+                "mode_match": mode_match,
+                "phase_error": phase_error,
+                "nearby_max_ready": nearby_max,
+            }
+        )
+    return {"rows": rows, "radius": radius}
+
+
 def _put_text(frame, text: str, origin, scale=0.66, thickness=2):
     cv2.putText(
         frame,
@@ -418,6 +466,10 @@ def _render(
     accepted = {
         frame for frame in _accepted_frames(root, video) if 0 <= frame < frame_count
     }
+    accepted_diag = _accepted_diagnostics(
+        predictions, accepted, expected_mode, expected_phase, ready_profiles
+    )
+    diag_by_frame = {int(row["frame"]): row for row in accepted_diag["rows"]}
 
     replay_dir = root / "replays"
     replay_dir.mkdir(parents=True, exist_ok=True)
@@ -526,6 +578,7 @@ def _render(
         _draw_timeline(frame, frame_index, frame_count, attack_frames, accepted)
         writer.write(frame)
 
+        diag = diag_by_frame.get(frame_index, {})
         csv_rows.append(
             {
                 "frame": frame_index,
@@ -540,6 +593,14 @@ def _render(
                 "phase_error": "" if phase_error is None else phase_error,
                 "human_attack": int(frame_index in attack_frames),
                 "accepted_candidate": int(frame_index in accepted),
+                "accepted_expected_phase_ready": diag.get("expected_phase_ready", ""),
+                "accepted_mode_match": (
+                    "" if diag.get("mode_match") is None else int(bool(diag["mode_match"]))
+                ),
+                "accepted_phase_error": (
+                    "" if diag.get("phase_error") is None else diag["phase_error"]
+                ),
+                "accepted_nearby_max_ready": diag.get("nearby_max_ready", ""),
             }
         )
         frame_index += 1
@@ -555,8 +616,26 @@ def _render(
         writer_csv.writerows(csv_rows)
 
     mode_accuracy = mode_hits / annotated if annotated else None
+    diag_rows = accepted_diag["rows"]
+    expected_ready_values = [
+        float(row["expected_phase_ready"])
+        for row in diag_rows
+        if row.get("expected_phase_ready") is not None
+    ]
+    accepted_mode_values = [
+        bool(row["mode_match"])
+        for row in diag_rows
+        if row.get("mode_match") is not None
+    ]
+    accepted_phase_errors = [
+        float(row["phase_error"])
+        for row in diag_rows
+        if row.get("phase_error") is not None
+    ]
+    nearby_ready_values = [float(row["nearby_max_ready"]) for row in diag_rows]
+
     report = {
-        "schema": 1,
+        "schema": 2,
         "character_root": str(root),
         "video": str(video),
         "rendered_video": str(output_video),
@@ -575,6 +654,32 @@ def _render(
             if accepted_ready
             else None
         ),
+        "accepted_expected_phase_ready_median": (
+            float(np.median(expected_ready_values)) if expected_ready_values else None
+        ),
+        "accepted_expected_phase_ready_ge_threshold_ratio": (
+            float(np.mean(np.asarray(expected_ready_values) >= ready_threshold))
+            if expected_ready_values
+            else None
+        ),
+        "accepted_mode_accuracy": (
+            float(np.mean(accepted_mode_values)) if accepted_mode_values else None
+        ),
+        "accepted_phase_error_median": (
+            float(np.median(accepted_phase_errors)) if accepted_phase_errors else None
+        ),
+        "accepted_phase_error_p90": (
+            float(np.percentile(accepted_phase_errors, 90)) if accepted_phase_errors else None
+        ),
+        "accepted_nearby_radius_frames": accepted_diag["radius"],
+        "accepted_nearby_max_ready_median": (
+            float(np.median(nearby_ready_values)) if nearby_ready_values else None
+        ),
+        "accepted_nearby_max_ready_ge_threshold_ratio": (
+            float(np.mean(np.asarray(nearby_ready_values) >= ready_threshold))
+            if nearby_ready_values
+            else None
+        ),
         "ready_threshold": ready_threshold,
     }
     write_json(output_report, report)
@@ -591,9 +696,28 @@ def _render(
         )
     if accepted_ready:
         print(
-            f"  accepted candidate READY median={np.median(accepted_ready):.3f} "
+            f"  accepted predicted READY median={np.median(accepted_ready):.3f} "
             f">={ready_threshold:.2f}: "
             f"{np.mean(np.asarray(accepted_ready) >= ready_threshold):.3f}"
+        )
+    if expected_ready_values:
+        print(
+            f"  accepted expected-phase READY median={np.median(expected_ready_values):.3f} "
+            f">={ready_threshold:.2f}: "
+            f"{np.mean(np.asarray(expected_ready_values) >= ready_threshold):.3f}"
+        )
+    if accepted_mode_values:
+        print(f"  accepted mode accuracy={np.mean(accepted_mode_values):.3f}")
+    if accepted_phase_errors:
+        print(
+            f"  accepted phase error median={np.median(accepted_phase_errors):.4f} "
+            f"p90={np.percentile(accepted_phase_errors, 90):.4f}"
+        )
+    if nearby_ready_values:
+        print(
+            f"  accepted +/-{accepted_diag['radius']}f max READY median="
+            f"{np.median(nearby_ready_values):.3f} >= {ready_threshold:.2f}: "
+            f"{np.mean(np.asarray(nearby_ready_values) >= ready_threshold):.3f}"
         )
     return output_video, report
 
