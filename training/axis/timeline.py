@@ -1,15 +1,14 @@
 """UP 视频轴时间线的数据模型与编译逻辑。
 
-工作流：annotate_video.py 逐帧标注生成 axis_timeline.json，本模块负责：
-- 时间线的加载 / 保存 / 校验；
-- 编译成 RawInputTimeline 宏源码（忌莫守式，事件 + 绝对间隔）；
-- 汇总成状态机轴节点报告（秧千穗式，按站场角色分组 + gap 建议）。
+时间线里的 event.ms 始终表示视频中“动作在画面上出现”的时刻，而不是实际
+按键时刻。编译时可按动作或动作转场配置视觉→输入提前量（lead），再把估计
+输入时刻转换成 RawInputTimeline 相对时间轴。
 
-关键概念——输入缓冲提前量（lead）：视频里标注的是"动作在画面上出现"的
-时刻，真实按键要早一个输入缓冲窗口。lead_ms 从标注时刻里减去这个提前量；
-默认 0（按画面原样），实机校准后再统一设置。
+lead 优先级：transition lead > action lead > global lead。
+例如 e:s2 可以专门描述“E 动画中切 2”的输入提前量，而不影响其它切人。
 
-本模块只依赖标准库，保证在 CI 里可测；cv2 只在标注器里使用。
+RawInputTimeline 从最早的估计输入开始（宏 t=0）。因此视频可以保留任意片头，
+不需要把视频第 0 帧误当成宏开始时刻；编译报告会保留宏原点对应的视频时刻。
 """
 
 from __future__ import annotations
@@ -20,8 +19,6 @@ from pathlib import Path
 
 
 # action token -> (输入类别, 默认按住时长 ms)
-# 类别：mouse=左键、key=键盘轻点、switch=切人数字键、marker=无输入的对齐标记。
-# 默认 hold 沿用忌莫守宏已实机验证的量级；z（重击）按住约半秒，w 短按前进。
 ACTIONS: dict[str, tuple[str, int]] = {
     "a": ("mouse", 78),
     "fall_a": ("mouse", 78),
@@ -38,8 +35,10 @@ ACTIONS: dict[str, tuple[str, int]] = {
 }
 
 SWITCH_TARGET = {"s1": 1, "s2": 2, "s3": 3}
-KEY_CODE = {"e": "e", "q": "q", "r": "r", "f": "f", "w": "w",
-            "s1": "1", "s2": "2", "s3": "3"}
+KEY_CODE = {
+    "e": "e", "q": "q", "r": "r", "f": "f", "w": "w",
+    "s1": "1", "s2": "2", "s3": "3",
+}
 
 SCHEMA_VERSION = 1
 
@@ -114,11 +113,125 @@ class Timeline:
 
 
 def frame_to_ms(frame: int, fps: float) -> int:
+    if fps <= 0:
+        raise ValueError("fps must be > 0")
     return round(frame / fps * 1000)
 
 
 # ---------------------------------------------------------------------------
-# 宏编译：时间线 -> RawInputTimeline 事件（down/up + 绝对间隔）
+# 视觉时刻 -> 估计输入时刻
+
+
+@dataclass(frozen=True)
+class EstimatedPress:
+    event: AxisVideoEvent
+    previous_action: str | None
+    lead_ms: int
+    source_press_ms: int  # 相对原视频第 0 帧，可为负数
+    macro_ms: int         # 最早估计输入归零后的宏时刻
+
+
+def _normalize_transition_leads(
+    transition_leads: dict[tuple[str, str] | str, int] | None,
+) -> dict[tuple[str, str], int]:
+    normalized: dict[tuple[str, str], int] = {}
+    for key, value in (transition_leads or {}).items():
+        if isinstance(key, tuple):
+            if len(key) != 2:
+                raise ValueError(f"invalid transition lead key: {key!r}")
+            before, after = key
+        else:
+            before, separator, after = str(key).partition(":")
+            if not separator:
+                raise ValueError(
+                    f"invalid transition lead key {key!r}; expected 'from:to'"
+                )
+        before = str(before).strip()
+        after = str(after).strip()
+        if before not in ACTIONS or after not in ACTIONS:
+            raise ValueError(f"unknown transition action: {before}:{after}")
+        if ACTIONS[after][0] == "marker":
+            raise ValueError(f"transition target has no input: {before}:{after}")
+        normalized[(before, after)] = int(value)
+    return normalized
+
+
+def estimate_press_schedule(
+    timeline: Timeline,
+    *,
+    lead_ms: int = 0,
+    action_leads: dict[str, int] | None = None,
+    transition_leads: dict[tuple[str, str] | str, int] | None = None,
+) -> tuple[list[EstimatedPress], list[str]]:
+    """按 lead 从视觉事件反推输入时刻，并以最早输入作为宏 t=0。
+
+    transition 使用前一个“有输入的视觉动作”作为 from；intro 等 marker 不参与。
+    不同 lead 可能让输入顺序与视觉出现顺序不同，这种情况会显式告警。
+    """
+
+    default_lead = int(lead_ms)
+    action_map = {str(key): int(value) for key, value in (action_leads or {}).items()}
+    for action in action_map:
+        if action not in ACTIONS or ACTIONS[action][0] == "marker":
+            raise ValueError(f"action lead is not valid for input action: {action}")
+    transition_map = _normalize_transition_leads(transition_leads)
+
+    visual_inputs = [
+        event for event in timeline.sorted_events()
+        if ACTIONS[event.action][0] != "marker"
+    ]
+    if not visual_inputs:
+        return [], []
+
+    raw_rows: list[tuple[int, AxisVideoEvent, str | None, int, int]] = []
+    previous_action: str | None = None
+    for visual_index, event in enumerate(visual_inputs):
+        transition_lead = (
+            transition_map.get((previous_action, event.action))
+            if previous_action is not None else None
+        )
+        effective_lead = (
+            transition_lead
+            if transition_lead is not None
+            else action_map.get(event.action, default_lead)
+        )
+        source_press_ms = event.ms - effective_lead
+        raw_rows.append((
+            visual_index, event, previous_action,
+            int(effective_lead), int(source_press_ms),
+        ))
+        previous_action = event.action
+
+    ordered = sorted(raw_rows, key=lambda row: (row[4], row[0]))
+    warnings: list[str] = []
+    if [row[0] for row in ordered] != list(range(len(raw_rows))):
+        warnings.append(
+            "不同动作/转场 lead 使估计按键顺序与视觉出现顺序不同；"
+            "这可能是输入缓冲，也可能是 lead 过大，请逐帧复查"
+        )
+
+    origin_ms = ordered[0][4]
+    if origin_ms < 0:
+        warnings.append(
+            f"最早估计输入位于视频起点前 {-origin_ms}ms；宏仍以该输入归零，"
+            "说明源视频前摇不足以直接验证这颗输入"
+        )
+
+    schedule = [
+        EstimatedPress(
+            event=event,
+            previous_action=previous,
+            lead_ms=effective_lead,
+            source_press_ms=source_press_ms,
+            macro_ms=source_press_ms - origin_ms,
+        )
+        for _, event, previous, effective_lead, source_press_ms in ordered
+    ]
+    return schedule, warnings
+
+
+# ---------------------------------------------------------------------------
+# 宏编译：估计输入时刻 -> RawInputTimeline 事件
 
 
 @dataclass(frozen=True)
@@ -134,51 +247,55 @@ def compile_macro(
     timeline: Timeline,
     lead_ms: int = 0,
     hold_overrides: dict[str, int] | None = None,
+    *,
+    action_leads: dict[str, int] | None = None,
+    transition_leads: dict[tuple[str, str] | str, int] | None = None,
 ) -> tuple[list[MacroStep], list[str]]:
-    """把标注时间线编译成 down/up 事件序列。
+    """把视觉时间线编译成 down/up 事件序列。
 
-    lead_ms：输入缓冲提前量，按键实际发生在画面时刻之前 lead_ms 毫秒。
-    返回 (事件列表, 告警列表)。告警包括：按住时长与下一事件重叠被截短、
-    首事件提前量被钳到 0 等。所有告警都不致命，但值得人工复查。
+    第一颗 down 固定为宏 t=0。原视频中的绝对估计输入时刻由
+    estimate_press_schedule() 保留，供逐帧对齐和校准使用。
     """
-    holds = dict(hold_overrides or {})
-    inputs = [e for e in timeline.sorted_events() if ACTIONS[e.action][0] != "marker"]
-    warnings: list[str] = []
+
+    holds = {str(key): int(value) for key, value in (hold_overrides or {}).items()}
+    schedule, warnings = estimate_press_schedule(
+        timeline,
+        lead_ms=lead_ms,
+        action_leads=action_leads,
+        transition_leads=transition_leads,
+    )
     steps: list[MacroStep] = []
 
-    press_times: list[int] = []
-    for event in inputs:
-        press = event.ms - lead_ms
-        if press < 0:
-            warnings.append(
-                f"{event.action}@{event.ms}ms: lead 补偿后早于 0，钳到 0"
-            )
-            press = 0
-        press_times.append(press)
-
-    for index, event in enumerate(inputs):
+    for index, row in enumerate(schedule):
+        event = row.event
         kind, default_hold = ACTIONS[event.action]
         hold = int(holds.get(event.action, default_hold))
-        press = press_times[index]
-        next_press = press_times[index + 1] if index + 1 < len(inputs) else None
+        if hold < 0:
+            raise ValueError(f"hold must be >= 0 for {event.action}")
+
+        press = row.macro_ms
+        next_press = schedule[index + 1].macro_ms if index + 1 < len(schedule) else None
 
         if next_press is not None:
             gap = next_press - press
             if gap <= 0:
                 warnings.append(
-                    f"{event.action}@{event.ms}ms 与下一事件同帧或乱序（gap={gap}ms），"
-                    "wait 记 0，请人工复查标注"
+                    f"{event.action}@{event.ms}ms 与下一估计输入同刻（gap={gap}ms），"
+                    "wait 记 0，请人工复查 lead/标注"
                 )
                 wait = 0
                 hold = min(hold, 10)
             elif hold >= gap:
-                clamped = max(10, gap - 10)
+                # 极限轴可能只有几 ms 间隔。旧实现最少强制 10ms hold，会得到负 wait。
+                # 这里保证 hold + wait == gap，且二者都不为负。
+                clamped = max(1, gap - 1) if gap > 1 else 1
+                clamped = min(clamped, gap)
                 warnings.append(
-                    f"{event.action}@{event.ms}ms: 默认按住 {hold}ms 超过与下一事件的间隔 "
+                    f"{event.action}@{event.ms}ms: 默认按住 {hold}ms 超过与下一估计输入的间隔 "
                     f"{gap}ms，截短为 {clamped}ms"
                 )
                 hold = clamped
-                wait = gap - hold
+                wait = max(0, gap - hold)
             else:
                 wait = gap - hold
         else:
@@ -190,7 +307,10 @@ def compile_macro(
             device, code = "key", KEY_CODE[event.action]
 
         stamp = f"@{event.ms / 1000:.3f}s"
-        label = f"{event.action} {stamp}" + (f" {event.note}" if event.note else "")
+        lead_text = f" lead={row.lead_ms}ms" if row.lead_ms else ""
+        label = f"{event.action} {stamp}{lead_text}" + (
+            f" {event.note}" if event.note else ""
+        )
         steps.append(MacroStep(device, code, "down", hold, f"{label} 按下"))
         steps.append(MacroStep(device, code, "up", wait, f"{label} 抬起"))
 
@@ -217,7 +337,7 @@ def macro_source(steps: list[MacroStep], name: str = "UP_MACRO") -> str:
 
 
 def reconstruct_press_times(steps: list[MacroStep]) -> list[int]:
-    """按 delay_after 语义重建每次按下的绝对时刻，用于测试与对齐验证。"""
+    """按 delay_after 语义重建每次按下的宏相对时刻，用于测试与对齐验证。"""
     at = 0
     presses = []
     for step in steps:
@@ -228,15 +348,11 @@ def reconstruct_press_times(steps: list[MacroStep]) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# 轴节点汇总：按站场角色分组，生成状态机轴的节点草表与 gap 报告
+# 轴节点汇总：按站场角色分组，保留视频视觉 gap
 
 
 def compile_axis_nodes(timeline: Timeline) -> list[dict]:
-    """把时间线按"谁在场上"切成节点：切人事件结束当前节点并开启下一个。
-
-    输出节点草表；具体落到 YangqianSuiAxis 风格文件时由人工整理，
-    gap 字段给出节点内相邻动作与节点间切换的画面实测间隔。
-    """
+    """把时间线按“谁在场上”切成节点；这里的 gap 是视频视觉时序。"""
     nodes: list[dict] = []
     current: dict | None = None
 
