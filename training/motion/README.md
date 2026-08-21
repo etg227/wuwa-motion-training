@@ -1,32 +1,8 @@
 # Character Motion Cycle Dataset
 
-> [!NOTE]
-> **拆库建议**：`training/` 已增长到约 7000 行，依赖（torch / mss / pynput /
-> tkinter）与启动器完全独立，也不在 `deploy.txt` 分发清单和 CI 覆盖范围内，
-> 建议迁入独立仓库。目录布局（`training/motion/` + `training_data/`）设计为
-> 可整体平移——在新仓库根目录保持同样的相对路径即可，`common.py` 的
-> `ROOT`/`DATA_ROOT` 与 `auto_train.py` 的子进程调用无需任何修改。迁移命令：
->
-> ```powershell
-> # 在 GitHub 上新建空仓库 <owner>/wuwa-motion-training 后（保留原路径深度与历史）：
-> git clone https://github.com/<owner>/wuwa-yg-launcher.git motion-split
-> cd motion-split
-> py -3.12 -m pip install git-filter-repo
-> git filter-repo --path training/ `
->   --path tests/TestPhaseTracker.py `
->   --path tests/TestReadyEvidence.py `
->   --path tests/TestLiveReadyProbe.py
-> git remote add origin https://github.com/<owner>/wuwa-motion-training.git
-> git push -u origin main
-> # 确认新仓库可用后，再在本仓库删除 training/ 与上述三个测试文件。
-> ```
->
-> 注意保留 `training/motion/` 的目录深度（不要把 `motion/` 提升到仓库根），
-> 否则 `common.py` 的 `ROOT = parents[2]` 会指向仓库外。
-
 这个实验训练集用于从连续游戏视频学习角色的**整套平A循环相位**，而不是预先规定角色有 3 段、4 段或 5 段平A。
 
-核心假设非常简单：连续平A时，只要某个可辨认动作/姿态再次出现，就说明完整平A循环经过了一轮。相邻两个“相同姿态”边界之间就是一个 `cycle`。
+核心假设很简单：连续平A时，只要某个可辨认动作/姿态再次出现，就说明完整平A循环经过了一轮。相邻两个“相同姿态”边界之间就是一个 `cycle`。
 
 模型最终输出 `0.0 ~ 1.0` 的循环相位：
 
@@ -36,11 +12,11 @@
 再次回到参考姿态    -> 下一轮 0%
 ```
 
-因此**不需要填写平A段数，也不需要把每次鼠标点击当成 A1/A2/A3 标签**。玩家持续连点 A 或 E 也不会直接污染动作标签；后续可以把输入日志作为 READY/ACCEPTED 的辅助数据单独使用。
+因此**不需要填写平A段数，也不需要把每次鼠标点击当成 A1/A2/A3 标签**。玩家持续连点 A 或 E 也不会直接污染动作标签；输入日志只作为 READY/ACCEPTED 等后续学习的辅助 telemetry。
 
 ## 数据目录
 
-真正的视频、cycle、模型都写到仓库外观上的本地目录 `training_data/`，并已加入 `.gitignore`：
+真正的视频、cycle、模型都写到本地 `training_data/`，该目录由仓库根 `.gitignore` 排除：
 
 ```text
 training_data/motion/
@@ -59,21 +35,29 @@ training_data/motion/
 
 ## 第一次准备环境
 
-主程序环境不强制安装 PyTorch。训练环境单独安装：
-
 ```powershell
 py -3.12 -m pip install -r training/motion/requirements.txt
 ```
 
-有 NVIDIA CUDA 环境时请按 PyTorch 官方对应 CUDA 版本安装 `torch/torchvision`；本脚本会自动优先使用 CUDA，没有则使用 CPU。
+有 NVIDIA CUDA 环境时请按 PyTorch 官方对应 CUDA 版本安装 `torch/torchvision`；脚本会自动优先使用 CUDA，没有则使用 CPU。
 
-## 明天最简单的采集方式
+## 推荐：自动采集与训练
 
-先从一个角色做 PoC，例如穗穗。录 20~60 秒视频，在同一段里**一直平A**即可。为了泛化，建议后续逐渐补充：不同地图、敌人、镜头角度、命中/未命中、不同画质和 FPS。
+日常采集优先运行：
 
-社区/B站视频也可以作为本地素材导入，`source=community` 只是记录来源类型；工具本身不负责下载视频。使用公开视频训练前请自行确认素材使用许可和平台/作者要求。
+```powershell
+py -3.12 training/motion/auto_train.py
+```
 
-导入你自己的录屏：
+详细流程见 [`AUTO_TRAIN.md`](AUTO_TRAIN.md)。这条流程会自动录制、保存输入 telemetry、搜索稳定 cycle、构建数据集并训练，不要求人工数平A段数。
+
+## 手工导入已有视频
+
+如果已经有本地录屏，可以导入后走手工检查流程。为了泛化，建议逐渐补充不同地图、敌人、镜头角度、命中/未命中、不同画质和 FPS。
+
+社区/B站视频也可以作为本地素材导入，`source=community` 只记录来源类型；工具本身不负责下载视频。使用公开视频训练前请自行确认素材使用许可和平台/作者要求。
+
+导入自己的录屏：
 
 ```powershell
 py -3.12 training/motion/import_video.py --character Suisui --video "D:\video\suisui_basic.mp4" --source self
@@ -91,7 +75,7 @@ py -3.12 training/motion/import_video.py --character Suisui --video "D:\video\gu
 training_data/motion/Suisui/videos/
 ```
 
-## 标记“同一个动作再次出现”
+## 手工标记“同一个动作再次出现”
 
 不需要标 A1/A2/A3。打开连续平A视频：
 
@@ -142,13 +126,13 @@ py -3.12 training/motion/build_dataset.py --character Suisui
 
 这一步不会把不同长度的动作强行压成同一个固定时长。
 
-## 训练
+## 训练 phase 模型
 
 ```powershell
 py -3.12 training/motion/train_phase_model.py --character Suisui --epochs 30
 ```
 
-第一版模型是轻量 CNN + GRU：每次看最近 12 帧，然后输出一个二维圆周向量，转换成 `0..1` 的 combo phase。
+phase 模型使用轻量 CNN + GRU：每次看最近一段连续帧，然后输出二维圆周向量并转换成 `0..1` 的 combo phase。
 
 使用 `sin/cos` 圆周目标是为了让：
 
@@ -170,9 +154,9 @@ phase 1%
 training_data/motion/Suisui/models/phase_model.pt
 ```
 
-最开始至少需要 3 个 cycle 才能跑；实际建议先准备 **30+ 个完整 cycle**，并尽量来自多个录屏。不要只录同一个背景几十遍。
+最开始至少需要 3 个 cycle 才能跑；实际建议积累更多完整 cycle，并尽量来自多个录屏，不要只录同一个背景几十遍。
 
-## 验证模型有没有真的学会一整套平A
+## 验证 phase 模型
 
 ```powershell
 py -3.12 training/motion/infer_phase_video.py ^
@@ -181,6 +165,8 @@ py -3.12 training/motion/infer_phase_video.py ^
 ```
 
 画面顶部会显示 `combo phase`。如果模型正确，连续平A过程中相位应大致持续前进，并在同一套动作重新开始时从接近 100% 回到 0%。终端也会打印 `cycle wrap`。
+
+进一步的离线验证可以使用 `replay_validate.py`、`replay_validate_tracked.py` 与 `replay_validate_evidence.py`。这些脚本用于比较 raw phase、跟踪器和 READY 实验逻辑，不会自动等同于实机输入成功。
 
 ## 为什么不拿连续点击直接当标签
 
@@ -191,9 +177,9 @@ A A A A A A ...
 E E E E ...
 ```
 
-很多输入只是“提前请求”，游戏并没有接受。把每一次点击都标成新动作会产生错误监督。因此当前 phase dataset 只相信**画面循环**。
+很多输入只是“提前请求”，游戏并没有接受。把每一次点击都标成新动作会产生错误监督。因此 phase dataset 只相信**画面循环**。
 
-以后第二阶段再加入输入 telemetry：
+输入 telemetry 的职责不同：
 
 ```text
 视觉：A动作正在运行
@@ -201,7 +187,7 @@ E E E E ...
 视觉：下一动作真正开始
 ```
 
-由此反推出 `CHAIN_READY / SKILL_READY / ACCEPTED` 窗口。也就是说：
+可以由此反推出 `CHAIN_READY / SKILL_READY / ACCEPTED` 的候选窗口。也就是说：
 
 ```text
 视频 phase 模型负责：角色现在运动到哪里
@@ -210,8 +196,6 @@ E E E E ...
 
 两者分开训练。
 
-## 下一步目标
+## 当前实验边界
 
-第一阶段只验证一个问题：**不告诉模型平A段数，只靠连续视频，它能否稳定跟踪完整平A循环相位。**
-
-如果穗穗 PoC 成功，再把同样流程用于 Chisa、YangYangSp、Jiyan 等角色。每个角色都可以拥有完全不同的动作长度和段数，训练管线不需要修改。
+`live_ready_probe.py` 和 `pydirect_transport_probe.py` 会产生真实输入，只用于受控实验。纯训练、模型构建和离线 replay 不需要运行这两个脚本。
