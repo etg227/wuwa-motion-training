@@ -1,457 +1,66 @@
-"""自动从高手/UP 视频提取重复轴结构与高置信度语义事件。
+"""高手 / UP 视频自动轴提取入口。
 
-这不是“直接看一条视频就凭空知道所有按键”的黑箱分类器。它同时利用：
-1. UP 视频自身的重复循环，自动学习 recurring visual event vocabulary；
-2. 本机已有 video + telemetry（如果存在），只学习 A/E/Q/R/切人的视觉响应原型；
-3. 右侧队伍 HUD 与技能 HUD 的变化，给切人候选与动作边界提供额外证据。
+auto_extract_core 保留视频扫描、prototype 构建与循环分析基础实现；本入口只负责
+把两类事件签名分流并施加 timeline fail-closed 护栏：
 
-输出不会发送任何输入，也不会自动改 launcher。
+- local signature（±1 analysis sample）只用于 visual clustering / recurrence；
+- semantic signature（-60ms → +40..220ms）只用于 telemetry prototype 分类；
+- 语义标签明显退化时仍保存 analysis/review/loops，但 auto_axis_timeline 写空。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
-from collections import Counter, defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
 import numpy as np
 
-AXIS_DIR = Path(__file__).resolve().parent
-MOTION_DIR = AXIS_DIR.parent / "motion"
-ROOT = AXIS_DIR.parents[1]
-sys.path.insert(0, str(AXIS_DIR))
-sys.path.insert(0, str(MOTION_DIR))
-
-from auto_analysis import (
-    align_period_boundaries,
-    classify_signature,
-    cluster_signatures,
-    confidence_from_signals,
-    detect_peaks,
-    dominant_label_share,
-    estimate_repetition_period,
-    loop_support,
-    normalize_rows,
-    normalize_vector,
-    robust_zscore,
-    smooth_signal,
+import auto_extract_core as core
+from auto_events import (
+    local_event_signatures,
+    semantic_event_signatures,
+    semantic_timeline_guard,
 )
-from semantic_inputs import load_semantic_events
-from timeline import AxisVideoEvent, Timeline
-
-
-SEMANTIC_TO_TOKEN = {
-    "ATTACK": "a",
-    "SKILL_E": "e",
-    "ECHO_Q": "q",
-    "LIBERATION_R": "r",
-    "SWAP_1": "s1",
-    "SWAP_2": "s2",
-    "SWAP_3": "s3",
-}
-SWITCH_TOKENS = {"s1": 1, "s2": 2, "s3": 3}
-
-# Normalized ROIs. They deliberately avoid relying on OCR/template assets.
-BODY_ROI = (0.06, 0.05, 0.82, 0.92)
-PARTY_ROI = (0.80, 0.12, 1.00, 0.78)
-ABILITY_ROI = (0.62, 0.67, 1.00, 1.00)
-
-# 事件签名与原型签名必须用同一时间尺度构造（before=-60ms，after 在 40..220ms
-# 里取变化最大的偏移）。旧版事件签名只看 ±1 个分析采样（30fps 下 ±33ms），
-# 与原型的 100~280ms 视界不匹配，会系统性压低跨类别区分度。
-SIGNATURE_BEFORE_MS = 60.0
-SIGNATURE_AFTER_OFFSETS_MS = (40.0, 70.0, 100.0, 135.0, 175.0, 220.0)
-
-
-@dataclass
-class SampledVideo:
-    source_fps: float
-    analysis_fps: float
-    total_frames: int
-    frame_indexes: np.ndarray
-    times_ms: np.ndarray
-    body: np.ndarray
-    party: np.ndarray
-    ability: np.ndarray
-
-
-@dataclass
-class PrototypeBank:
-    samples: dict[str, np.ndarray]
-    source_files: int
-    source_events: int
-
-    def counts(self) -> dict[str, int]:
-        return {token: int(len(rows)) for token, rows in self.samples.items()}
 
 
 def _json_dump(path: Path, payload) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _crop_feature(frame: np.ndarray, roi, size: tuple[int, int]) -> np.ndarray:
-    height, width = frame.shape[:2]
-    x0, y0, x1, y1 = roi
-    left = int(np.clip(round(x0 * width), 0, max(0, width - 1)))
-    right = int(np.clip(round(x1 * width), left + 1, width))
-    top = int(np.clip(round(y0 * height), 0, max(0, height - 1)))
-    bottom = int(np.clip(round(y1 * height), top + 1, height))
-    crop = frame[top:bottom, left:right]
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, size, interpolation=cv2.INTER_AREA)
-    gray = cv2.equalizeHist(gray)
-    value = gray.astype(np.float32).reshape(-1) / 255.0
-    value -= float(value.mean())
-    return normalize_vector(value)
-
-
-def _descriptors(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    body = _crop_feature(frame, BODY_ROI, (24, 14))
-    party = _crop_feature(frame, PARTY_ROI, (14, 24))
-    ability = _crop_feature(frame, ABILITY_ROI, (24, 14))
-    return body, party, ability
-
-
-def _signature_from_descriptors(
-    before: tuple[np.ndarray, np.ndarray, np.ndarray],
-    after: tuple[np.ndarray, np.ndarray, np.ndarray],
-) -> np.ndarray:
-    parts = [np.abs(after[index] - before[index]) for index in range(3)]
-    return normalize_vector(np.concatenate(parts))
-
-
-def _sample_video(video: Path, requested_fps: float | None) -> SampledVideo:
-    cap = cv2.VideoCapture(str(video))
-    if not cap.isOpened():
-        raise RuntimeError(f"cannot open video: {video}")
-    source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if source_fps <= 0 or total_frames <= 0:
-        cap.release()
-        raise RuntimeError(f"invalid video metadata: fps={source_fps} frames={total_frames}")
-
-    analysis_fps = source_fps if not requested_fps or requested_fps <= 0 else min(source_fps, requested_fps)
-    analysis_fps = min(60.0, max(4.0, analysis_fps))
-    step = source_fps / analysis_fps
-
-    frame_indexes: list[int] = []
-    bodies: list[np.ndarray] = []
-    parties: list[np.ndarray] = []
-    abilities: list[np.ndarray] = []
-    frame_index = 0
-    next_sample = 0.0
-
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if frame_index + 1e-6 >= next_sample:
-            body, party, ability = _descriptors(frame)
-            frame_indexes.append(frame_index)
-            bodies.append(body)
-            parties.append(party)
-            abilities.append(ability)
-            next_sample += step
-        frame_index += 1
-        if frame_index % max(1, int(source_fps * 20)) == 0:
-            print(f"  video scan: {frame_index / source_fps:.0f}s / {total_frames / source_fps:.0f}s")
-
-    cap.release()
-    if len(frame_indexes) < 20:
-        raise RuntimeError("video is too short for automatic analysis")
-
-    frames = np.asarray(frame_indexes, dtype=np.int32)
-    return SampledVideo(
-        source_fps=source_fps,
-        analysis_fps=analysis_fps,
-        total_frames=total_frames,
-        frame_indexes=frames,
-        times_ms=np.rint(frames / source_fps * 1000.0).astype(np.int64),
-        body=np.stack(bodies).astype(np.float32),
-        party=np.stack(parties).astype(np.float32),
-        ability=np.stack(abilities).astype(np.float32),
-    )
-
-
-def _delta_norms(matrix: np.ndarray) -> np.ndarray:
-    result = np.zeros(len(matrix), dtype=np.float32)
-    if len(matrix) > 1:
-        result[1:] = np.linalg.norm(matrix[1:] - matrix[:-1], axis=1)
-    return result
-
-
-def _event_signatures(sampled: SampledVideo, indexes: list[int]) -> np.ndarray:
-    """按与原型完全一致的时间尺度构造事件签名。
-
-    before 取事件前约 60ms 的采样；after 在事件后 40..220ms 的候选偏移里选
-    原始变化量最大的一个，再归一化差分。这样事件签名和 telemetry 原型是
-    同一种向量，余弦匹配才是同类比较。
-    """
-    fps = sampled.analysis_fps
-    count = len(sampled.body)
-    before_offset = max(1, int(round(SIGNATURE_BEFORE_MS * fps / 1000.0)))
-    after_offsets = sorted({
-        max(1, int(round(offset * fps / 1000.0)))
-        for offset in SIGNATURE_AFTER_OFFSETS_MS
-    })
-
-    rows = []
-    for index in indexes:
-        before_index = max(0, index - before_offset)
-        before = (
-            sampled.body[before_index],
-            sampled.party[before_index],
-            sampled.ability[before_index],
-        )
-        best_signature = None
-        best_change = -1.0
-        for offset in after_offsets:
-            after_index = min(count - 1, index + offset)
-            if after_index <= before_index:
-                continue
-            after = (
-                sampled.body[after_index],
-                sampled.party[after_index],
-                sampled.ability[after_index],
-            )
-            raw_change = sum(
-                float(np.linalg.norm(after[part] - before[part])) for part in range(3)
-            )
-            if raw_change > best_change:
-                best_change = raw_change
-                best_signature = _signature_from_descriptors(before, after)
-        if best_signature is None:
-            dimension = sampled.body.shape[1] + sampled.party.shape[1] + sampled.ability.shape[1]
-            best_signature = np.zeros(dimension, dtype=np.float32)
-        rows.append(best_signature)
-
-    if not rows:
-        dimension = sampled.body.shape[1] + sampled.party.shape[1] + sampled.ability.shape[1]
-        return np.empty((0, dimension), dtype=np.float32)
-    return np.stack(rows).astype(np.float32)
-
-
-def _loop_detection(sampled: SampledVideo, min_loop_s: float, max_loop_s: float):
-    stride = max(1, int(round(sampled.analysis_fps / 6.0)))
-    body = sampled.body[::stride]
-    party = sampled.party[::stride]
-    ability = sampled.ability[::stride]
-    loop_features = normalize_rows(np.concatenate((0.65 * body, 1.10 * party, 0.85 * ability), axis=1))
-    loop_fps = sampled.analysis_fps / stride
-    max_loop_s = min(max_loop_s, len(loop_features) / loop_fps / 2.05)
-    if max_loop_s <= min_loop_s:
-        return None, [], stride, loop_fps
-
-    estimate = estimate_repetition_period(
-        loop_features,
-        min_lag=max(2, int(round(min_loop_s * loop_fps))),
-        max_lag=max(2, int(round(max_loop_s * loop_fps))),
-    )
-    if estimate is None:
-        return None, [], stride, loop_fps
-
-    boundaries = align_period_boundaries(
-        loop_features,
-        estimate.lag,
-        estimate.anchor,
-        minimum_similarity=max(0.08, estimate.score - 0.35),
-    )
-    sample_boundaries = [min(len(sampled.body) - 1, index * stride) for index, _ in boundaries]
-    return estimate, list(zip(sample_boundaries, [score for _, score in boundaries])), stride, loop_fps
-
-
-def _read_frame_at(cap, source_fps: float, t_ms: float):
-    frame = max(0, int(round(t_ms / 1000.0 * source_fps)))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
-    ok, image = cap.read()
-    return image if ok else None
-
-
-def _prototype_roots(explicit: list[str] | None) -> list[Path]:
-    if explicit:
-        return [Path(value).expanduser().resolve() for value in explicit]
-    candidates = [
-        ROOT / "training_data" / "motion",
-        ROOT.parent / "wuwa-yg-launcher" / "training_data" / "motion",
-    ]
-    return [path for path in candidates if path.exists()]
-
-
-def _build_prototype_bank(roots: list[Path], max_per_token: int = 36) -> PrototypeBank:
-    rows: dict[str, list[np.ndarray]] = defaultdict(list)
-    source_files = 0
-    source_events = 0
-
-    telemetry_files: list[Path] = []
-    for root in roots:
-        if root.exists():
-            telemetry_files.extend(root.rglob("*.inputs.jsonl"))
-
-    for telemetry in sorted(set(telemetry_files)):
-        video_name = telemetry.name.removesuffix(".inputs.jsonl") + ".mp4"
-        video = telemetry.with_name(video_name)
-        if not video.is_file():
-            continue
-        events = load_semantic_events(telemetry, edge="down")
-        useful = [event for event in events if event.get("semantic") in SEMANTIC_TO_TOKEN]
-        if not useful:
-            continue
-
-        cap = cv2.VideoCapture(str(video))
-        if not cap.isOpened():
-            continue
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        if fps <= 0:
-            cap.release()
-            continue
-
-        used_file = False
-        for event in useful:
-            token = SEMANTIC_TO_TOKEN[str(event["semantic"])]
-            if len(rows[token]) >= max_per_token:
-                continue
-            t_ms = float(event.get("t_ms", 0.0))
-            before_frame = _read_frame_at(cap, fps, max(0.0, t_ms - 60.0))
-            if before_frame is None:
-                continue
-            before = _descriptors(before_frame)
-
-            best_signature = None
-            best_change = -1.0
-            for offset in (40.0, 70.0, 100.0, 135.0, 175.0, 220.0):
-                after_frame = _read_frame_at(cap, fps, t_ms + offset)
-                if after_frame is None:
-                    continue
-                after = _descriptors(after_frame)
-                signature = _signature_from_descriptors(before, after)
-                change = float(np.linalg.norm(signature))
-                raw_change = sum(float(np.linalg.norm(after[i] - before[i])) for i in range(3))
-                if change > 0 and raw_change > best_change:
-                    best_change = raw_change
-                    best_signature = signature
-            if best_signature is not None:
-                rows[token].append(best_signature)
-                source_events += 1
-                used_file = True
-
-        cap.release()
-        if used_file:
-            source_files += 1
-
-    samples = {
-        token: normalize_rows(np.stack(values)).astype(np.float32)
-        for token, values in rows.items()
-        if values
-    }
-    return PrototypeBank(samples=samples, source_files=source_files, source_events=source_events)
-
-
-def _classify_signature(signature: np.ndarray, bank: PrototypeBank):
-    if not bank.samples:
-        return None, 0.0, {}
-    # 区分性分类与单类别护栏统一在 auto_analysis.classify_signature：
-    # 原型库不足 2 个语义类别时不分类（margin 无意义），只返回分数供诊断。
-    return classify_signature(signature, bank.samples)
-
-
-def _propagate_cluster_semantics(events: list[dict]) -> None:
-    by_cluster: dict[int, list[dict]] = defaultdict(list)
-    for event in events:
-        by_cluster[int(event["cluster"])].append(event)
-
-    for rows in by_cluster.values():
-        known = [row for row in rows if row.get("semantic") and row.get("semantic_confidence", 0.0) >= 0.62]
-        if not known:
-            continue
-        counts = Counter(str(row["semantic"]) for row in known)
-        token, count = counts.most_common(1)[0]
-        if count / len(known) < 0.75:
-            continue
-        base_conf = float(np.median([row["semantic_confidence"] for row in known if row["semantic"] == token]))
-        for row in rows:
-            if row.get("semantic") is None and int(row.get("recurrence_support", 1)) >= 2:
-                row["semantic"] = token
-                row["semantic_confidence"] = round(min(0.82, base_conf * 0.82), 4)
-                row["semantic_source"] = "recurrence-propagated"
-
-
-def _loop_template(events: list[dict], boundaries: list[int]) -> list[dict]:
-    if len(boundaries) < 3:
-        return []
-    rows: dict[tuple[int, int], list[dict]] = defaultdict(list)
-    for event in events:
-        sample_index = int(event["sample_index"])
-        for loop_index in range(len(boundaries) - 1):
-            left, right = boundaries[loop_index], boundaries[loop_index + 1]
-            if left <= sample_index < right:
-                phase = (sample_index - left) / max(1, right - left)
-                phase_bin = int(round(phase / 0.035))
-                rows[(int(event["cluster"]), phase_bin)].append({**event, "loop": loop_index, "phase": phase})
-                break
-
-    template = []
-    loop_count = len(boundaries) - 1
-    for (cluster, _), occurrences in rows.items():
-        distinct_loops = sorted({int(row["loop"]) for row in occurrences})
-        if len(distinct_loops) < 2:
-            continue
-        phases = [float(row["phase"]) for row in occurrences]
-        semantics = [str(row["semantic"]) for row in occurrences if row.get("semantic")]
-        semantic = Counter(semantics).most_common(1)[0][0] if semantics else None
-        template.append({
-            "cluster": cluster,
-            "phase_median": round(float(np.median(phases)), 5),
-            "support_loops": len(distinct_loops),
-            "loop_count": loop_count,
-            "semantic": semantic,
-            "occurrence_ms": [int(row["ms"]) for row in occurrences],
-        })
-    template.sort(key=lambda row: row["phase_median"])
-    return template
-
-
-def _merge_review_windows(items: list[dict], max_items: int) -> list[dict]:
-    if not items:
-        return []
-    items.sort(key=lambda row: (int(row["start_ms"]), int(row["end_ms"])))
-    merged: list[dict] = []
-    for item in items:
-        if merged and int(item["start_ms"]) <= int(merged[-1]["end_ms"]) + 100:
-            merged[-1]["end_ms"] = max(int(merged[-1]["end_ms"]), int(item["end_ms"]))
-            merged[-1]["reasons"] = sorted(set(merged[-1]["reasons"] + item["reasons"]))
-            merged[-1]["priority"] = max(float(merged[-1]["priority"]), float(item["priority"]))
-        else:
-            merged.append(dict(item))
-    merged.sort(key=lambda row: float(row["priority"]), reverse=True)
-    return merged[:max_items]
-
-
 def _write_timeline(
     path: Path,
     video: Path,
-    sampled: SampledVideo,
+    sampled: core.SampledVideo,
     events: list[dict],
     start_slot: int,
     semantic_threshold: float,
+    *,
+    blocked_reason: str | None = None,
 ) -> int:
-    timeline = Timeline(
+    note = (
+        f"auto_extract timeline blocked: {blocked_reason}"
+        if blocked_reason
+        else "auto_extract high-confidence semantic events; verify review.json before compiling"
+    )
+    timeline = core.Timeline(
         video=video.name,
         fps=sampled.source_fps,
         start_slot=start_slot,
-        source_note="auto_extract high-confidence semantic events; verify review.json before compiling",
+        source_note=note,
     )
+    if blocked_reason:
+        timeline.save(path)
+        return 0
+
     current_slot = start_slot
     count = 0
     for row in sorted(events, key=lambda item: int(item["ms"])):
         token = row.get("semantic")
         confidence = float(row.get("semantic_confidence", 0.0))
-        if token not in SEMANTIC_TO_TOKEN.values() or confidence < semantic_threshold:
+        if token not in core.SEMANTIC_TO_TOKEN.values() or confidence < semantic_threshold:
             continue
-        timeline.events.append(AxisVideoEvent(
+        timeline.events.append(core.AxisVideoEvent(
             frame=int(row["frame"]),
             ms=int(row["ms"]),
             action=str(token),
@@ -459,23 +68,33 @@ def _write_timeline(
             note=f"auto conf={confidence:.2f} cluster={row['cluster']}",
         ))
         count += 1
-        if token in SWITCH_TOKENS:
-            current_slot = SWITCH_TOKENS[str(token)]
+        if token in core.SWITCH_TOKENS:
+            current_slot = core.SWITCH_TOKENS[str(token)]
     timeline.save(path)
     return count
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Automatically extract recurring axis structure from an UP video")
+    parser = argparse.ArgumentParser(
+        description="Automatically extract recurring axis structure from an UP video"
+    )
     parser.add_argument("--video", required=True, type=Path)
     parser.add_argument("--out-prefix", default=None)
-    parser.add_argument("--analysis-fps", type=float, default=0.0,
-                        help="0=use source FPS up to 60; event timing keeps original frame granularity")
+    parser.add_argument(
+        "--analysis-fps",
+        type=float,
+        default=0.0,
+        help="0=use source FPS up to 60; event timing keeps original frame granularity",
+    )
     parser.add_argument("--start-slot", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--min-loop-s", type=float, default=8.0)
     parser.add_argument("--max-loop-s", type=float, default=45.0)
-    parser.add_argument("--prototype-root", action="append", default=None,
-                        help="training_data/motion root; may be repeated")
+    parser.add_argument(
+        "--prototype-root",
+        action="append",
+        default=None,
+        help="training_data/motion root; may be repeated",
+    )
     parser.add_argument("--no-self-prototypes", action="store_true")
     parser.add_argument("--semantic-threshold", type=float, default=0.66)
     parser.add_argument("--max-review", type=int, default=18)
@@ -484,27 +103,32 @@ def main() -> int:
     video = args.video.expanduser().resolve()
     if not video.is_file():
         raise SystemExit(f"video not found: {video}")
-    prefix = Path(args.out_prefix).expanduser().resolve() if args.out_prefix else video.with_suffix("")
+    prefix = (
+        Path(args.out_prefix).expanduser().resolve()
+        if args.out_prefix
+        else video.with_suffix("")
+    )
 
     print(f"[1/5] scan video: {video}")
-    sampled = _sample_video(video, args.analysis_fps)
+    sampled = core._sample_video(video, args.analysis_fps)
     print(
         f"  source={sampled.source_fps:.3f}fps analysis={sampled.analysis_fps:.3f}fps "
         f"samples={len(sampled.frame_indexes)}"
     )
 
-    body_delta = _delta_norms(sampled.body)
-    party_delta = _delta_norms(sampled.party)
-    ability_delta = _delta_norms(sampled.ability)
+    body_delta = core._delta_norms(sampled.body)
+    party_delta = core._delta_norms(sampled.party)
+    ability_delta = core._delta_norms(sampled.ability)
     raw_activity = 0.48 * body_delta + 0.22 * party_delta + 0.30 * ability_delta
     smooth_radius = max(1, int(round(sampled.analysis_fps * 0.025)))
-    activity = smooth_signal(raw_activity, radius=smooth_radius)
-    activity_z = robust_zscore(activity)
-    party_z = robust_zscore(party_delta)
+    activity = core.smooth_signal(raw_activity, radius=smooth_radius)
+    activity_z = core.robust_zscore(activity)
+    party_z = core.robust_zscore(party_delta)
 
     print("[2/5] discover repeated rotation")
-    period, boundary_rows, _loop_stride, loop_fps = _loop_detection(
-        sampled, args.min_loop_s, args.max_loop_s)
+    period, boundary_rows, _loop_stride, loop_fps = core._loop_detection(
+        sampled, args.min_loop_s, args.max_loop_s
+    )
     boundaries = [int(index) for index, _ in boundary_rows]
     if period and len(boundaries) >= 3:
         print(
@@ -517,31 +141,40 @@ def main() -> int:
         analysis_left, analysis_right = 0, len(sampled.body) - 1
 
     min_distance = max(2, int(round(sampled.analysis_fps * 0.10)))
-    peak_indexes = detect_peaks(
+    peak_indexes = core.detect_peaks(
         activity,
         min_distance=min_distance,
         threshold_z=1.9,
         max_peaks=max(32, int((sampled.times_ms[-1] / 1000.0) * 5.0)),
     )
-    peak_indexes = [index for index in peak_indexes if analysis_left <= index <= analysis_right]
-    signatures = _event_signatures(sampled, peak_indexes)
-    clusters = cluster_signatures(signatures, similarity_threshold=0.72)
-    recurrence = loop_support(
+    peak_indexes = [
+        index for index in peak_indexes if analysis_left <= index <= analysis_right
+    ]
+
+    visual_signatures = local_event_signatures(
+        sampled.body, sampled.party, sampled.ability, peak_indexes
+    )
+    clusters = core.cluster_signatures(visual_signatures, similarity_threshold=0.72)
+    recurrence = core.loop_support(
         np.asarray(peak_indexes, dtype=np.int32),
         clusters.labels,
         boundaries,
         phase_tolerance=0.06,
     )
     print(f"  event candidates={len(peak_indexes)} visual clusters={len(clusters.counts)}")
+    print("  signature scopes: visual=local ±1 sample; semantic=-60ms -> +40..220ms")
 
     print("[3/5] build optional self-telemetry visual prototypes")
     if args.no_self_prototypes:
-        bank = PrototypeBank(samples={}, source_files=0, source_events=0)
+        bank = core.PrototypeBank(samples={}, source_files=0, source_events=0)
         roots = []
     else:
-        roots = _prototype_roots(args.prototype_root)
-        bank = _build_prototype_bank(roots)
-    print(f"  prototype roots={len(roots)} files={bank.source_files} events={bank.source_events} counts={bank.counts()}")
+        roots = core._prototype_roots(args.prototype_root)
+        bank = core._build_prototype_bank(roots)
+    print(
+        f"  prototype roots={len(roots)} files={bank.source_files} "
+        f"events={bank.source_events} counts={bank.counts()}"
+    )
     if bank.samples and len(bank.samples) < 2:
         only = ", ".join(sorted(bank.samples))
         print(
@@ -550,9 +183,19 @@ def main() -> int:
             "（auto_train 录制即可，不需要打得好）补齐类别后重跑。"
         )
 
+    semantic_signatures = semantic_event_signatures(
+        sampled.body,
+        sampled.party,
+        sampled.ability,
+        peak_indexes,
+        sampled.analysis_fps,
+    )
+
     events: list[dict] = []
     for pos, sample_index in enumerate(peak_indexes):
-        token, semantic_conf, scores = _classify_signature(signatures[pos], bank)
+        token, semantic_conf, scores = core._classify_signature(
+            semantic_signatures[pos], bank
+        )
         swap_candidate = bool(
             party_z[sample_index] >= 2.0
             and party_delta[sample_index] >= ability_delta[sample_index] * 1.08
@@ -572,31 +215,31 @@ def main() -> int:
             "semantic": token,
             "semantic_confidence": round(float(semantic_conf), 4),
             "semantic_source": "self-telemetry-prototype" if token else None,
-            "prototype_scores": {key: round(value, 4) for key, value in scores.items()},
+            "prototype_scores": {
+                key: round(value, 4) for key, value in scores.items()
+            },
         }
         events.append(event)
 
-    _propagate_cluster_semantics(events)
+    core._propagate_cluster_semantics(events)
     for event in events:
-        event["confidence"] = round(confidence_from_signals(
-            float(event["activity_z"]),
-            int(event["recurrence_support"]),
-            float(event.get("semantic_confidence") or 0.0),
-        ), 4)
-
-    # 标签退化检测：几乎所有事件被标成同一 token 通常意味着原型证据失衡，
-    # 而不是视频里真的只有一种动作。
-    degenerate_warning = None
-    labeled_tokens = [str(event["semantic"]) for event in events if event.get("semantic")]
-    dominant_token, dominant_share = dominant_label_share(labeled_tokens)
-    if len(labeled_tokens) >= 8 and dominant_share > 0.85:
-        degenerate_warning = (
-            f"标签退化：{len(labeled_tokens)} 个语义事件里 {dominant_share:.0%} 都是 "
-            f"'{dominant_token}'。原型证据很可能失衡，勿直接使用本轮 timeline。"
+        event["confidence"] = round(
+            core.confidence_from_signals(
+                float(event["activity_z"]),
+                int(event["recurrence_support"]),
+                float(event.get("semantic_confidence") or 0.0),
+            ),
+            4,
         )
-        print(f"  警告：{degenerate_warning}")
 
-    template = _loop_template(events, boundaries)
+    labeled_tokens = [
+        str(event["semantic"]) for event in events if event.get("semantic")
+    ]
+    timeline_blocked_reason = semantic_timeline_guard(labeled_tokens)
+    if timeline_blocked_reason:
+        print(f"  警告：{timeline_blocked_reason}")
+
+    template = core._loop_template(events, boundaries)
 
     print("[4/5] create low-touch review list and timeline")
     review_items = []
@@ -609,7 +252,10 @@ def main() -> int:
         if int(event["recurrence_support"]) >= 2 and not event.get("semantic"):
             reasons.append("recurring event semantic unknown")
             priority = max(priority, 0.85)
-        if event.get("semantic") and float(event.get("semantic_confidence", 0.0)) < args.semantic_threshold:
+        if (
+            event.get("semantic")
+            and float(event.get("semantic_confidence", 0.0)) < args.semantic_threshold
+        ):
             reasons.append("semantic confidence below timeline threshold")
             priority = max(priority, 0.70)
         if reasons:
@@ -620,7 +266,9 @@ def main() -> int:
                 "reasons": reasons,
                 "event_ms": int(event["ms"]),
             })
-    review = _merge_review_windows(review_items, max_items=max(1, args.max_review))
+    review = core._merge_review_windows(
+        review_items, max_items=max(1, args.max_review)
+    )
 
     analysis_path = Path(str(prefix) + ".auto_analysis.json")
     loops_path = Path(str(prefix) + ".loops.json")
@@ -653,32 +301,45 @@ def main() -> int:
         events,
         args.start_slot,
         args.semantic_threshold,
+        blocked_reason=timeline_blocked_reason,
     )
 
     analysis_payload = {
-        "schema": 1,
+        "schema": 2,
         "video": str(video),
         "source_fps": sampled.source_fps,
         "analysis_fps": sampled.analysis_fps,
         "frame_time_ms": round(1000.0 / sampled.source_fps, 4),
         "prototype_roots": [str(path) for path in roots],
         "prototype_counts": bank.counts(),
+        "signature_scopes": {
+            "visual_cluster": "local ±1 analysis sample",
+            "semantic_classifier": "-60ms before, best +40..220ms after",
+        },
         "loop": loop_payload,
         "events": events,
         "review_count": len(review),
         "timeline_event_count": timeline_count,
+        "timeline_blocked": bool(timeline_blocked_reason),
+        "timeline_blocked_reason": timeline_blocked_reason,
         "notes": [
             "30fps source has about 33.3ms visual-frame quantization; the extractor does not invent missing source frames.",
             "Self telemetry prototypes teach visual semantics only; expert timing comes from the UP video and recurrence alignment.",
+            "Visual clustering uses local signatures; semantic prototype matching uses a separate longer time horizon.",
             "Unknown recurring clusters are intentionally kept as unknown instead of being forced into A/E/Q/R labels.",
+            "Degenerate semantic labels fail closed: analysis is preserved but the compileable timeline is written empty.",
         ],
-        "warnings": [line for line in (degenerate_warning,) if line],
+        "warnings": [
+            line for line in (timeline_blocked_reason,) if line
+        ],
     }
     _json_dump(analysis_path, analysis_payload)
 
-    high_recurrence = sum(1 for row in events if int(row["recurrence_support"]) >= 2)
+    high_recurrence = sum(
+        1 for row in events if int(row["recurrence_support"]) >= 2
+    )
     semantic_events = sum(1 for row in events if row.get("semantic"))
-    report = "\n".join([
+    report_lines = [
         f"video: {video}",
         f"source_fps: {sampled.source_fps:.3f} (frame≈{1000.0 / sampled.source_fps:.2f}ms)",
         f"analysis_fps: {sampled.analysis_fps:.3f}",
@@ -686,6 +347,7 @@ def main() -> int:
         f"recurring_candidates: {high_recurrence}",
         f"semantic_candidates: {semantic_events}",
         f"timeline_high_confidence_events: {timeline_count}",
+        f"timeline_blocked: {'yes' if timeline_blocked_reason else 'no'}",
         f"review_windows: {len(review)}",
         f"loop_period_ms: {loop_payload['period_ms']}",
         f"loop_score: {loop_payload['period_score']}",
@@ -696,9 +358,18 @@ def main() -> int:
         f"  {review_path}",
         f"  {timeline_path}",
         "",
-        "重要：auto_axis_timeline 只包含高置信度且已能映射到现有轴 token 的事件。",
-        "先看 analysis/review；不要因为 timeline 文件存在就直接当成最终实机轴。",
-    ] + ([f"", f"警告：{degenerate_warning}"] if degenerate_warning else []))
+    ]
+    if timeline_blocked_reason:
+        report_lines.extend([
+            f"警告：{timeline_blocked_reason}",
+            "auto_axis_timeline 已按 fail-closed 写为空 timeline；analysis/review/loops 仍可继续用于离线研究。",
+        ])
+    else:
+        report_lines.extend([
+            "重要：auto_axis_timeline 只包含高置信度且已能映射到现有轴 token 的事件。",
+            "先看 analysis/review；不要因为 timeline 文件存在就直接当成最终实机轴。",
+        ])
+    report = "\n".join(report_lines)
     report_path.write_text(report + "\n", encoding="utf-8")
 
     print("[5/5] done")
