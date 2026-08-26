@@ -72,3 +72,48 @@ class TestAutoAxisAnalysis(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClassifySignature(unittest.TestCase):
+    def _bank(self, tokens):
+        # 每个 token 一组正交方向的原型
+        base = np.eye(4, dtype=np.float32)
+        return {token: np.stack([base[index]] * 3) for index, token in enumerate(tokens)}
+
+    def test_single_class_bank_never_classifies(self):
+        # 首次实测的故障：只有 'a' 原型时 margin 恒等于最高分，
+        # 99 个事件全部被标成高置信度普攻。单类别必须拒绝分类。
+        from auto_analysis import classify_signature
+
+        bank = self._bank(["a"])
+        signature = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        token, confidence, scores = classify_signature(signature, bank)
+        self.assertIsNone(token)
+        self.assertEqual(confidence, 0.0)
+        self.assertIn("a", scores)  # 分数仍保留供诊断
+
+    def test_two_class_bank_classifies_clear_match(self):
+        from auto_analysis import classify_signature
+
+        bank = self._bank(["a", "e"])
+        signature = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        token, confidence, _ = classify_signature(signature, bank)
+        self.assertEqual(token, "a")
+        self.assertGreater(confidence, 0.5)
+
+    def test_ambiguous_match_rejected_by_margin(self):
+        from auto_analysis import classify_signature
+
+        bank = self._bank(["a", "e"])
+        # 与两类原型等距的方向：margin≈0，必须拒绝
+        signature = np.array([0.7071, 0.7071, 0.0, 0.0], dtype=np.float32)
+        token, _, _ = classify_signature(signature, bank)
+        self.assertIsNone(token)
+
+    def test_dominant_label_share(self):
+        from auto_analysis import dominant_label_share
+
+        token, share = dominant_label_share(["a"] * 9 + ["e"])
+        self.assertEqual(token, "a")
+        self.assertAlmostEqual(share, 0.9)
+        self.assertEqual(dominant_label_share([]), (None, 0.0))

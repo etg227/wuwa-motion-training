@@ -28,9 +28,11 @@ sys.path.insert(0, str(MOTION_DIR))
 
 from auto_analysis import (
     align_period_boundaries,
+    classify_signature,
     cluster_signatures,
     confidence_from_signals,
     detect_peaks,
+    dominant_label_share,
     estimate_repetition_period,
     loop_support,
     normalize_rows,
@@ -57,6 +59,12 @@ SWITCH_TOKENS = {"s1": 1, "s2": 2, "s3": 3}
 BODY_ROI = (0.06, 0.05, 0.82, 0.92)
 PARTY_ROI = (0.80, 0.12, 1.00, 0.78)
 ABILITY_ROI = (0.62, 0.67, 1.00, 1.00)
+
+# 事件签名与原型签名必须用同一时间尺度构造（before=-60ms，after 在 40..220ms
+# 里取变化最大的偏移）。旧版事件签名只看 ±1 个分析采样（30fps 下 ±33ms），
+# 与原型的 100~280ms 视界不匹配，会系统性压低跨类别区分度。
+SIGNATURE_BEFORE_MS = 60.0
+SIGNATURE_AFTER_OFFSETS_MS = (40.0, 70.0, 100.0, 135.0, 175.0, 220.0)
 
 
 @dataclass
@@ -177,15 +185,50 @@ def _delta_norms(matrix: np.ndarray) -> np.ndarray:
 
 
 def _event_signatures(sampled: SampledVideo, indexes: list[int]) -> np.ndarray:
+    """按与原型完全一致的时间尺度构造事件签名。
+
+    before 取事件前约 60ms 的采样；after 在事件后 40..220ms 的候选偏移里选
+    原始变化量最大的一个，再归一化差分。这样事件签名和 telemetry 原型是
+    同一种向量，余弦匹配才是同类比较。
+    """
+    fps = sampled.analysis_fps
+    count = len(sampled.body)
+    before_offset = max(1, int(round(SIGNATURE_BEFORE_MS * fps / 1000.0)))
+    after_offsets = sorted({
+        max(1, int(round(offset * fps / 1000.0)))
+        for offset in SIGNATURE_AFTER_OFFSETS_MS
+    })
+
     rows = []
     for index in indexes:
-        before = max(0, index - 1)
-        after = min(len(sampled.body) - 1, index + 1)
-        rows.append(normalize_vector(np.concatenate([
-            np.abs(sampled.body[after] - sampled.body[before]),
-            np.abs(sampled.party[after] - sampled.party[before]),
-            np.abs(sampled.ability[after] - sampled.ability[before]),
-        ])))
+        before_index = max(0, index - before_offset)
+        before = (
+            sampled.body[before_index],
+            sampled.party[before_index],
+            sampled.ability[before_index],
+        )
+        best_signature = None
+        best_change = -1.0
+        for offset in after_offsets:
+            after_index = min(count - 1, index + offset)
+            if after_index <= before_index:
+                continue
+            after = (
+                sampled.body[after_index],
+                sampled.party[after_index],
+                sampled.ability[after_index],
+            )
+            raw_change = sum(
+                float(np.linalg.norm(after[part] - before[part])) for part in range(3)
+            )
+            if raw_change > best_change:
+                best_change = raw_change
+                best_signature = _signature_from_descriptors(before, after)
+        if best_signature is None:
+            dimension = sampled.body.shape[1] + sampled.party.shape[1] + sampled.ability.shape[1]
+            best_signature = np.zeros(dimension, dtype=np.float32)
+        rows.append(best_signature)
+
     if not rows:
         dimension = sampled.body.shape[1] + sampled.party.shape[1] + sampled.ability.shape[1]
         return np.empty((0, dimension), dtype=np.float32)
@@ -310,21 +353,9 @@ def _build_prototype_bank(roots: list[Path], max_per_token: int = 36) -> Prototy
 def _classify_signature(signature: np.ndarray, bank: PrototypeBank):
     if not bank.samples:
         return None, 0.0, {}
-    scores: dict[str, float] = {}
-    for token, samples in bank.samples.items():
-        similarities = samples @ signature
-        top = np.sort(similarities)[-min(3, len(similarities)):]
-        scores[token] = float(np.mean(top))
-    ordered = sorted(scores.items(), key=lambda row: row[1], reverse=True)
-    best_token, best_score = ordered[0]
-    second_score = ordered[1][1] if len(ordered) > 1 else 0.0
-    margin = best_score - second_score
-    score_term = float(np.clip((best_score - 0.42) / 0.30, 0.0, 1.0))
-    margin_term = float(np.clip((margin - 0.015) / 0.12, 0.0, 1.0))
-    confidence = 0.68 * score_term + 0.32 * margin_term
-    if best_score < 0.48 or margin < 0.025:
-        return None, confidence, scores
-    return best_token, float(np.clip(confidence, 0.0, 1.0)), scores
+    # 区分性分类与单类别护栏统一在 auto_analysis.classify_signature：
+    # 原型库不足 2 个语义类别时不分类（margin 无意义），只返回分数供诊断。
+    return classify_signature(signature, bank.samples)
 
 
 def _propagate_cluster_semantics(events: list[dict]) -> None:
@@ -511,6 +542,13 @@ def main() -> int:
         roots = _prototype_roots(args.prototype_root)
         bank = _build_prototype_bank(roots)
     print(f"  prototype roots={len(roots)} files={bank.source_files} events={bank.source_events} counts={bank.counts()}")
+    if bank.samples and len(bank.samples) < 2:
+        only = ", ".join(sorted(bank.samples))
+        print(
+            f"  警告：原型库只有 1 个语义类别（{only}），无法做区分性分类，"
+            "本轮语义标注停用。请录一段刻意按 E/Q/R/切人的 telemetry "
+            "（auto_train 录制即可，不需要打得好）补齐类别后重跑。"
+        )
 
     events: list[dict] = []
     for pos, sample_index in enumerate(peak_indexes):
@@ -545,6 +583,18 @@ def main() -> int:
             int(event["recurrence_support"]),
             float(event.get("semantic_confidence") or 0.0),
         ), 4)
+
+    # 标签退化检测：几乎所有事件被标成同一 token 通常意味着原型证据失衡，
+    # 而不是视频里真的只有一种动作。
+    degenerate_warning = None
+    labeled_tokens = [str(event["semantic"]) for event in events if event.get("semantic")]
+    dominant_token, dominant_share = dominant_label_share(labeled_tokens)
+    if len(labeled_tokens) >= 8 and dominant_share > 0.85:
+        degenerate_warning = (
+            f"标签退化：{len(labeled_tokens)} 个语义事件里 {dominant_share:.0%} 都是 "
+            f"'{dominant_token}'。原型证据很可能失衡，勿直接使用本轮 timeline。"
+        )
+        print(f"  警告：{degenerate_warning}")
 
     template = _loop_template(events, boundaries)
 
@@ -622,6 +672,7 @@ def main() -> int:
             "Self telemetry prototypes teach visual semantics only; expert timing comes from the UP video and recurrence alignment.",
             "Unknown recurring clusters are intentionally kept as unknown instead of being forced into A/E/Q/R labels.",
         ],
+        "warnings": [line for line in (degenerate_warning,) if line],
     }
     _json_dump(analysis_path, analysis_payload)
 
@@ -647,7 +698,7 @@ def main() -> int:
         "",
         "重要：auto_axis_timeline 只包含高置信度且已能映射到现有轴 token 的事件。",
         "先看 analysis/review；不要因为 timeline 文件存在就直接当成最终实机轴。",
-    ])
+    ] + ([f"", f"警告：{degenerate_warning}"] if degenerate_warning else []))
     report_path.write_text(report + "\n", encoding="utf-8")
 
     print("[5/5] done")

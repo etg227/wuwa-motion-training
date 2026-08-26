@@ -320,3 +320,50 @@ def confidence_from_signals(
     semantic_term = float(np.clip(semantic_confidence or 0.0, 0.0, 1.0))
     score = 0.40 * activity_term + 0.35 * recurrence_term + 0.25 * semantic_term
     return float(np.clip(score, 0.0, 1.0))
+
+
+def classify_signature(
+    signature: np.ndarray,
+    samples_by_token: dict[str, np.ndarray],
+    *,
+    min_classes: int = 2,
+    score_floor: float = 0.48,
+    margin_floor: float = 0.025,
+) -> tuple[str | None, float, dict[str, float]]:
+    """用原型库对一个事件签名做区分性分类。
+
+    margin（最高分与第二名的差距）只有在原型库至少包含 min_classes 个语义
+    类别时才有意义：单类别时不存在竞争者，margin 恒等于最高分，置信门会被
+    击穿——首次实测中只有 'a' 原型的库把 99 个事件全部标成了高置信度普攻。
+    因此类别不足时一律不分类，只返回分数供诊断。
+    """
+    scores: dict[str, float] = {}
+    for token, samples in samples_by_token.items():
+        similarities = samples @ signature
+        top = np.sort(similarities)[-min(3, len(similarities)):]
+        scores[token] = float(np.mean(top))
+
+    if len(samples_by_token) < max(2, int(min_classes)):
+        return None, 0.0, scores
+
+    ordered = sorted(scores.items(), key=lambda row: row[1], reverse=True)
+    best_token, best_score = ordered[0]
+    second_score = ordered[1][1]
+    margin = best_score - second_score
+    score_term = float(np.clip((best_score - 0.42) / 0.30, 0.0, 1.0))
+    margin_term = float(np.clip((margin - 0.015) / 0.12, 0.0, 1.0))
+    confidence = 0.68 * score_term + 0.32 * margin_term
+    if best_score < score_floor or margin < margin_floor:
+        return None, confidence, scores
+    return best_token, float(np.clip(confidence, 0.0, 1.0)), scores
+
+
+def dominant_label_share(labels: list[str]) -> tuple[str | None, float]:
+    """返回出现最多的标签及其占比；标签退化检测用（全被标成同一 token）。"""
+    if not labels:
+        return None, 0.0
+    counts: dict[str, int] = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    token = max(counts, key=lambda key: counts[key])
+    return token, counts[token] / len(labels)
