@@ -7,6 +7,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "training" / "axis"))
 
 from auto_swaps import (
+    SwapCandidate,
+    adaptive_phase_tolerance,
     build_swap_payloads,
     circular_phase_distance,
     detect_party_transitions,
@@ -20,9 +22,9 @@ def _normalize(vector):
 
 
 class TestAutoSwaps(unittest.TestCase):
-    def _synthetic(self, loops=4, loop_samples=100, fps=30.0):
+    def _synthetic(self, loops=4, loop_samples=1200, fps=30.0):
         rng = np.random.default_rng(12)
-        dimension = 36
+        dimension = 24
         states = [_normalize(rng.normal(size=dimension)) for _ in range(3)]
         party = []
         ability = []
@@ -38,7 +40,7 @@ class TestAutoSwaps(unittest.TestCase):
                 else:
                     state = states[0]
                 party.append(_normalize(
-                    state + rng.normal(scale=0.015, size=dimension)
+                    state + rng.normal(scale=0.012, size=dimension)
                 ))
                 ability.append(_normalize(rng.normal(size=dimension)))
         return (
@@ -48,8 +50,27 @@ class TestAutoSwaps(unittest.TestCase):
             fps,
         )
 
+    def _candidate(self, sample_index, signature, pre, post, score=0.9):
+        return SwapCandidate(
+            sample_index=sample_index,
+            score=score,
+            party_z=5.0,
+            state_change=0.4,
+            persistence=0.9,
+            hud_ratio=2.0,
+            signature=_normalize(signature),
+            pre_state=_normalize(pre),
+            post_state=_normalize(post),
+        )
+
     def test_circular_phase_distance_wraps(self):
         self.assertAlmostEqual(circular_phase_distance(0.99, 0.01), 0.02)
+
+    def test_adaptive_tolerance_turns_point04_into_few_frames(self):
+        boundaries = [0, 1200, 2400, 3600, 4800]
+        tolerance = adaptive_phase_tolerance(boundaries, 0.04)
+        self.assertLess(tolerance, 0.004)
+        self.assertGreater(tolerance, 0.003)
 
     def test_detects_recurring_three_swap_pattern(self):
         party, ability, boundaries, fps = self._synthetic()
@@ -58,19 +79,51 @@ class TestAutoSwaps(unittest.TestCase):
         phases = [row["phase"] for row in groups]
         self.assertEqual(len(phases), 3)
         for actual, expected in zip(phases, (0.20, 0.50, 0.80)):
-            self.assertLess(abs(actual - expected), 0.025)
+            self.assertLess(abs(actual - expected), 0.006)
         self.assertTrue(all(len(row["occurrences"]) == 4 for row in groups))
+        self.assertTrue(all(row["state_consistency"] > 0.9 for row in groups))
 
     def test_one_loop_spike_does_not_become_recurring_swap(self):
         party, ability, boundaries, fps = self._synthetic()
         rng = np.random.default_rng(99)
         transient = _normalize(rng.normal(size=party.shape[1]))
-        party[34:40] = transient
+        # 只污染第一轮 phase≈0.35；其它轮没有对应 transition。
+        party[410:430] = transient
         candidates = detect_party_transitions(party, ability, fps)
         groups = recurring_swap_groups(candidates, boundaries)
         self.assertTrue(
-            all(circular_phase_distance(row["phase"], 0.35) > 0.04 for row in groups)
+            all(circular_phase_distance(row["phase"], 0.35) > 0.01 for row in groups)
         )
+
+    def test_phase_only_matches_more_than_few_frames_are_rejected(self):
+        boundaries = [0, 1200, 2400, 3600, 4800]
+        signature = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        pre = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+        post = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+        phases = [0.200, 0.220, 0.185, 0.215]
+        candidates = [
+            self._candidate(
+                loop * 1200 + int(round(phase * 1200)),
+                signature,
+                pre,
+                post,
+            )
+            for loop, phase in enumerate(phases)
+        ]
+        self.assertEqual(recurring_swap_groups(candidates, boundaries), [])
+
+    def test_same_phase_but_different_hud_transition_identity_is_rejected(self):
+        boundaries = [0, 1200, 2400, 3600, 4800]
+        candidates = []
+        for loop in range(4):
+            basis = np.eye(12, dtype=np.float32)
+            candidates.append(self._candidate(
+                loop * 1200 + 600,
+                basis[loop],
+                basis[4 + loop],
+                basis[8 + loop],
+            ))
+        self.assertEqual(recurring_swap_groups(candidates, boundaries), [])
 
     def test_build_payload_attaches_recurring_outgoing_cluster(self):
         party, ability, boundaries, fps = self._synthetic()
@@ -79,8 +132,8 @@ class TestAutoSwaps(unittest.TestCase):
         frames = np.arange(count, dtype=np.int32)
         events = []
         for loop_index in range(4):
-            base = loop_index * 100
-            for offset, cluster in ((18, 7), (48, 9), (78, 11)):
+            base = loop_index * 1200
+            for offset, cluster in ((216, 7), (576, 9), (936, 11)):
                 sample = base + offset
                 events.append({
                     "ms": int(times_ms[sample]),
@@ -102,6 +155,8 @@ class TestAutoSwaps(unittest.TestCase):
         )
         self.assertEqual(swaps["strong_transition_count"], 3)
         self.assertEqual(len(windows["windows"]), 3)
+        self.assertLess(swaps["effective_phase_tolerance"], 0.004)
+        self.assertAlmostEqual(swaps["strong_spread_limit_ms"], 200.0, places=1)
         self.assertEqual(
             [row["outgoing_cluster"] for row in swaps["transitions"]],
             [7, 9, 11],

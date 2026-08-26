@@ -2,10 +2,12 @@
 
 不尝试恢复 UP 主真实按键时刻。这里输出的是：
 - 右侧队伍 HUD 的稳定转场候选；
-- 不同 rotation 中重复出现的 visual swap phase；
+- 不同 rotation 中重复出现、且 HUD 转场形状一致的 visual swap phase；
 - 最近的 recurring visual cluster 作为 outgoing anchor；
 - visual success window（P10/P50/P90），供后续 action-phase/cancel 建模。
 
+重要：phase 匹配容差按“几帧”自适应，而不是直接把 rotation 的 4% 当窗口。
+39.8s rotation 的 0.04 相当于约 1.6s，会把大量普通 HUD 变化错误拼成切人。
 30fps 源的基本时间量化仍是约 33.3ms；本模块不会插值伪造输入时刻。
 """
 
@@ -48,6 +50,15 @@ def _unwrap_phase(phase: float, center: float) -> float:
     return value
 
 
+def _pairwise_median(rows: list[np.ndarray]) -> float:
+    if len(rows) < 2:
+        return 1.0
+    matrix = np.stack(rows).astype(np.float32)
+    similarities = matrix @ matrix.T
+    upper = similarities[np.triu_indices(len(matrix), 1)]
+    return float(np.median(upper)) if len(upper) else 1.0
+
+
 @dataclass(frozen=True)
 class SwapCandidate:
     sample_index: int
@@ -73,8 +84,9 @@ def detect_party_transitions(
 ) -> list[SwapCandidate]:
     """找队伍 HUD 的 step-like 转场。
 
-    先以 frame-to-frame party HUD delta 找尖峰，再用转场前/后的稳定窗口验证
-    “旧状态 -> 新状态”确实持续存在，避免把一帧特效/压缩噪声当成切人。
+    这一层故意保持较高 recall：先找 frame-to-frame party HUD 尖峰，再用转场
+    前后的稳定窗口验证“旧状态 -> 新状态”持续存在。真正的 precision 主要在
+    cross-loop recurring grouping：phase、transition signature、pre/post state 都要一致。
     """
 
     if analysis_fps <= 0:
@@ -179,6 +191,54 @@ def _map_to_loops(
     return rows
 
 
+def adaptive_phase_tolerance(
+    boundaries: list[int],
+    requested: float,
+    *,
+    frame_budget: float = 4.0,
+    floor: float = 0.0025,
+) -> float:
+    """把 phase 容差限制到约几帧，而不是 rotation 的固定百分比。
+
+    例如 39.8s / 30fps rotation 约 1195 个分析采样：4 帧约等于 phase 0.00335。
+    即使 CLI 仍传 0.04，也只把它当“最大上限”，不会再允许 ±1.6s 配对。
+    """
+
+    if requested <= 0:
+        raise ValueError("phase tolerance must be > 0")
+    lengths = [
+        int(right) - int(left)
+        for left, right in zip(boundaries, boundaries[1:])
+        if int(right) > int(left)
+    ]
+    if not lengths:
+        return float(min(requested, max(floor, 0.01)))
+    median_samples = float(np.median(np.asarray(lengths, dtype=np.float32)))
+    frame_phase = frame_budget / max(median_samples, 1.0)
+    return float(min(requested, max(floor, frame_phase)))
+
+
+def _transition_compatibility(
+    left: SwapCandidate,
+    right: SwapCandidate,
+) -> tuple[float, float, float, float]:
+    signature_similarity = float(np.dot(left.signature, right.signature))
+    pre_similarity = float(np.dot(left.pre_state, right.pre_state))
+    post_similarity = float(np.dot(left.post_state, right.post_state))
+
+    # Directional transition 必须大体一致；同时要求转场前/后 HUD 状态各自相似。
+    # 阈值故意不是极高，保留压缩/特效噪声，但会排除“只是 phase 接近”的随机变化。
+    if signature_similarity < 0.20 or pre_similarity < 0.52 or post_similarity < 0.52:
+        return -1.0, signature_similarity, pre_similarity, post_similarity
+
+    compatibility = (
+        0.50 * np.clip((signature_similarity + 0.10) / 1.10, 0.0, 1.0)
+        + 0.25 * np.clip((pre_similarity - 0.40) / 0.60, 0.0, 1.0)
+        + 0.25 * np.clip((post_similarity - 0.40) / 0.60, 0.0, 1.0)
+    )
+    return float(compatibility), signature_similarity, pre_similarity, post_similarity
+
+
 def recurring_swap_groups(
     candidates: list[SwapCandidate],
     boundaries: list[int],
@@ -186,7 +246,7 @@ def recurring_swap_groups(
     phase_tolerance: float = 0.04,
     min_support: int | None = None,
 ) -> list[dict]:
-    """把不同 rotation 中相近 phase 的 HUD 转场合成 recurring swap。"""
+    """把不同 rotation 中相近 phase、且 HUD 转场身份一致的事件合成 recurring swap。"""
 
     loop_count = max(0, len(boundaries) - 1)
     if loop_count < 2 or not candidates:
@@ -195,26 +255,38 @@ def recurring_swap_groups(
         min_support = 3 if loop_count >= 4 else 2
     min_support = max(2, min(int(min_support), loop_count))
 
+    effective_tolerance = adaptive_phase_tolerance(boundaries, phase_tolerance)
     mapped = _map_to_loops(candidates, boundaries)
     seeds: list[dict] = []
 
-    for seed_candidate, _seed_loop, seed_phase in mapped:
-        chosen = []
+    for seed_candidate, seed_loop, seed_phase in mapped:
+        chosen = [(seed_candidate, seed_loop, seed_phase)]
         for loop_index in range(loop_count):
-            options = [
-                row for row in mapped
-                if row[1] == loop_index
-                and circular_phase_distance(row[2], seed_phase) <= phase_tolerance
-            ]
-            if not options:
+            if loop_index == seed_loop:
                 continue
-            options.sort(
-                key=lambda row: (
-                    circular_phase_distance(row[2], seed_phase),
-                    -row[0].score,
+            options = []
+            for row in mapped:
+                candidate, candidate_loop, candidate_phase = row
+                if candidate_loop != loop_index:
+                    continue
+                phase_distance = circular_phase_distance(candidate_phase, seed_phase)
+                if phase_distance > effective_tolerance:
+                    continue
+                compatibility, sig_sim, pre_sim, post_sim = _transition_compatibility(
+                    seed_candidate, candidate
                 )
-            )
-            chosen.append(options[0])
+                if compatibility < 0:
+                    continue
+                # 先按 phase，再用 HUD transition identity / candidate quality 破平。
+                rank = (
+                    phase_distance / max(effective_tolerance, 1e-6)
+                    - 0.30 * compatibility
+                    - 0.08 * candidate.score
+                )
+                options.append((rank, row, sig_sim, pre_sim, post_sim))
+            if options:
+                options.sort(key=lambda item: item[0])
+                chosen.append(options[0][1])
 
         if len(chosen) < min_support:
             continue
@@ -227,25 +299,30 @@ def recurring_swap_groups(
         p10, p50, p90 = np.percentile(unwrapped, [10, 50, 90]).tolist()
         spread = float(p90 - p10)
 
-        signatures = np.stack([row[0].signature for row in chosen])
-        if len(signatures) >= 2:
-            similarities = signatures @ signatures.T
-            upper = similarities[np.triu_indices(len(signatures), 1)]
-            signature_consistency = float(np.median(upper))
-        else:
-            signature_consistency = 1.0
+        signature_consistency = _pairwise_median(
+            [row[0].signature for row in chosen]
+        )
+        pre_state_consistency = _pairwise_median(
+            [row[0].pre_state for row in chosen]
+        )
+        post_state_consistency = _pairwise_median(
+            [row[0].post_state for row in chosen]
+        )
+        state_consistency = min(pre_state_consistency, post_state_consistency)
 
         support_ratio = len(chosen) / loop_count
         phase_stability = float(
-            np.clip(1.0 - spread / max(phase_tolerance * 2.0, 1e-6), 0.0, 1.0)
+            np.clip(1.0 - spread / max(effective_tolerance * 1.25, 1e-6), 0.0, 1.0)
         )
         candidate_quality = float(np.median([row[0].score for row in chosen]))
-        signature_term = float(np.clip((signature_consistency + 0.20) / 1.20, 0.0, 1.0))
+        transition_term = float(np.clip((signature_consistency - 0.10) / 0.90, 0.0, 1.0))
+        state_term = float(np.clip((state_consistency - 0.45) / 0.55, 0.0, 1.0))
         confidence = (
-            0.45 * support_ratio
+            0.35 * support_ratio
             + 0.25 * phase_stability
-            + 0.20 * candidate_quality
-            + 0.10 * signature_term
+            + 0.18 * transition_term
+            + 0.12 * state_term
+            + 0.10 * candidate_quality
         )
 
         seeds.append({
@@ -254,7 +331,11 @@ def recurring_swap_groups(
             "phase_p50_unwrapped": float(p50),
             "phase_p90_unwrapped": float(p90),
             "phase_spread": spread,
+            "effective_phase_tolerance": effective_tolerance,
             "signature_consistency": signature_consistency,
+            "pre_state_consistency": pre_state_consistency,
+            "post_state_consistency": post_state_consistency,
+            "state_consistency": state_consistency,
             "confidence": float(np.clip(confidence, 0.0, 1.0)),
             "occurrences": chosen,
         })
@@ -266,15 +347,21 @@ def recurring_swap_groups(
         )
     )
     result = []
-    accepted_phases: list[float] = []
+    accepted: list[dict] = []
     for row in seeds:
-        if any(
-            circular_phase_distance(float(row["phase"]), phase)
-            < phase_tolerance * 0.5
-            for phase in accepted_phases
-        ):
+        duplicate = False
+        seed_candidate = row["occurrences"][0][0]
+        for existing in accepted:
+            if circular_phase_distance(float(row["phase"]), float(existing["phase"])) >= effective_tolerance * 0.75:
+                continue
+            existing_candidate = existing["occurrences"][0][0]
+            compatibility, *_ = _transition_compatibility(seed_candidate, existing_candidate)
+            if compatibility >= 0:
+                duplicate = True
+                break
+        if duplicate:
             continue
-        accepted_phases.append(float(row["phase"]))
+        accepted.append(row)
         result.append(row)
 
     return sorted(result, key=lambda row: float(row["phase"]))
@@ -322,19 +409,33 @@ def build_swap_payloads(
     analysis_right: int | None = None,
     phase_tolerance: float = 0.04,
 ) -> tuple[dict, dict]:
-    """生成 swaps.json / swap_windows.json 的可序列化 payload。"""
+    """生成 swaps.json / swap_windows.json 的可序列化 payload。
+
+    swaps.json 保留 recurring 候选；swap_windows.json 只收真正窄且 HUD identity 一致
+    的 strong visual-success windows。这样宽到几百毫秒/秒级的 recurring HUD 变化
+    不会再被冒充成严格切人窗口。
+    """
 
     loop_count = max(0, len(boundaries) - 1)
     period_ms = None
+    period_samples = None
     if loop_count >= 1:
         loop_durations = [
             float(times_ms[right] - times_ms[left])
             for left, right in zip(boundaries, boundaries[1:])
             if 0 <= left < len(times_ms) and 0 <= right < len(times_ms)
         ]
+        sample_lengths = [
+            int(right) - int(left)
+            for left, right in zip(boundaries, boundaries[1:])
+            if int(right) > int(left)
+        ]
         if loop_durations:
             period_ms = float(np.median(loop_durations))
+        if sample_lengths:
+            period_samples = float(np.median(np.asarray(sample_lengths, dtype=np.float32)))
 
+    effective_tolerance = adaptive_phase_tolerance(boundaries, phase_tolerance)
     candidates = detect_party_transitions(
         party,
         ability,
@@ -351,6 +452,8 @@ def build_swap_payloads(
     swaps = []
     windows = []
     frame_ms = 1000.0 / max(float(source_fps), 1e-6)
+    # strong 的时间离散必须是“几帧级”：30fps 时 6 帧≈200ms；60fps 时至少 140ms。
+    strong_spread_limit_ms = max(frame_ms * 6.0, 140.0)
 
     for transition_index, group in enumerate(groups, start=1):
         occurrences = []
@@ -421,12 +524,16 @@ def build_swap_payloads(
             else phase_spread / max(analysis_fps, 1e-6) * 1000.0
         )
         visual_spread_ms = max(frame_ms, float(observed_spread_ms))
-        status = (
-            "strong"
-            if support_loops >= (3 if loop_count >= 4 else 2)
-            and float(group["confidence"]) >= 0.62
-            else "weak"
+
+        minimum_support = 3 if loop_count >= 4 else 2
+        strong = bool(
+            support_loops >= minimum_support
+            and visual_spread_ms <= strong_spread_limit_ms
+            and float(group["signature_consistency"]) >= 0.30
+            and float(group["state_consistency"]) >= 0.58
+            and float(group["confidence"]) >= 0.68
         )
+        status = "strong" if strong else "recurring"
 
         row = {
             "transition": transition_index,
@@ -445,9 +552,11 @@ def build_swap_payloads(
             "phase_spread": round(phase_spread, 6),
             "visual_spread_ms": round(float(visual_spread_ms), 2),
             "frame_quantization_ms": round(frame_ms, 3),
-            "signature_consistency": round(
-                float(group["signature_consistency"]), 4
-            ),
+            "effective_phase_tolerance": round(float(group["effective_phase_tolerance"]), 6),
+            "signature_consistency": round(float(group["signature_consistency"]), 4),
+            "pre_state_consistency": round(float(group["pre_state_consistency"]), 4),
+            "post_state_consistency": round(float(group["post_state_consistency"]), 4),
+            "state_consistency": round(float(group["state_consistency"]), 4),
             "confidence": round(float(group["confidence"]), 4),
             "outgoing_cluster": anchor_cluster,
             "outgoing_cluster_support": anchor_support,
@@ -456,7 +565,7 @@ def build_swap_payloads(
         }
         swaps.append(row)
 
-        if status == "strong":
+        if strong:
             windows.append({
                 "transition": transition_index,
                 "support_loops": support_loops,
@@ -469,37 +578,46 @@ def build_swap_payloads(
                     "offset_p90": row["phase_offset_p90"],
                 },
                 "visual_spread_ms": row["visual_spread_ms"],
+                "signature_consistency": row["signature_consistency"],
+                "state_consistency": row["state_consistency"],
                 "outgoing_cluster": anchor_cluster,
                 "outgoing_gap_ms": anchor_gap_summary,
                 "confidence": row["confidence"],
                 "execution_ready": False,
                 "reason": (
-                    "video-only visual success window; not the hidden key-down time "
+                    "narrow recurring video-only visual success window; not the hidden key-down time "
                     "and not yet an outgoing-action phase model"
                 ),
             })
 
     swaps_payload = {
-        "schema": 1,
+        "schema": 2,
         "detector": "video-only recurring party-HUD transition",
         "loop_count": loop_count,
         "loop_period_ms": round(period_ms, 2) if period_ms is not None else None,
+        "loop_period_samples": round(period_samples, 2) if period_samples is not None else None,
+        "requested_phase_tolerance": float(phase_tolerance),
+        "effective_phase_tolerance": round(effective_tolerance, 6),
+        "strong_spread_limit_ms": round(strong_spread_limit_ms, 2),
         "candidate_count": len(candidates),
         "recurring_transition_count": len(swaps),
         "strong_transition_count": sum(row["status"] == "strong" for row in swaps),
         "transitions": swaps,
         "notes": [
             "No self telemetry is used to decide swap timing.",
-            "rotation_phase is relative to the automatically discovered team rotation.",
+            "requested phase tolerance is an upper bound; actual cross-loop matching is reduced to a few-frame adaptive tolerance.",
+            "Cross-loop matches must agree in transition signature and in both pre/post HUD state, not only in rotation phase.",
+            "Wide recurring HUD changes stay in swaps.json but do not enter swap_windows.json.",
             "Anonymous HUD transitions are not mapped to s1/s2/s3 until target slot evidence is reliable.",
         ],
     }
     windows_payload = {
-        "schema": 1,
+        "schema": 2,
         "execution_ready": False,
+        "strong_spread_limit_ms": round(strong_spread_limit_ms, 2),
         "windows": windows,
         "notes": [
-            "These are recurring visual-success windows, not physical input timestamps.",
+            "These are narrow recurring visual-success windows, not physical input timestamps.",
             "Use outgoing_cluster/gap as an offline anchor; a later action-phase model must convert it into a cancel/request window.",
             "30fps source keeps roughly 33.3ms visual quantization.",
         ],
