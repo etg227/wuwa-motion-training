@@ -23,8 +23,6 @@ class TestAutoEventSignatures(unittest.TestCase):
 
     def test_local_and_semantic_signatures_use_different_time_scopes(self):
         body, party, ability = self._empty_streams()
-        # event index=3：局部 ±1 sample 只看到 frame4 的 x 方向变化；
-        # 长视界在 +40..220ms 中会选到 frame7 更大的 y 方向变化。
         body[4] = np.array([1.0, 0.0], dtype=np.float32)
         body[7] = np.array([0.0, 3.0], dtype=np.float32)
 
@@ -56,6 +54,12 @@ class TestAutoEventSignatures(unittest.TestCase):
 
 
 class TestSemanticTimelineGuard(unittest.TestCase):
+    def test_no_labels_fail_closed(self):
+        reason = semantic_timeline_guard([])
+        self.assertIsNotNone(reason)
+        self.assertIn("没有可用的语义事件", reason)
+        self.assertIn("阻止", reason)
+
     def test_sparse_labels_do_not_block(self):
         self.assertIsNone(semantic_timeline_guard(["a"] * 7))
 
@@ -69,7 +73,7 @@ class TestSemanticTimelineGuard(unittest.TestCase):
         self.assertIn("阻止", reason)
 
     def test_share_at_threshold_is_not_blocked(self):
-        labels = ["a"] * 17 + ["e"] * 3  # exactly 85%
+        labels = ["a"] * 17 + ["e"] * 3
         self.assertIsNone(
             semantic_timeline_guard(labels, max_dominant_share=0.85)
         )

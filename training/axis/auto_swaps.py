@@ -18,6 +18,10 @@ from dataclasses import dataclass
 import numpy as np
 
 
+SIGNATURE_SIMILARITY_MIN = 0.20
+STATE_SIMILARITY_MIN = 0.52
+
+
 def _normalize(vector: np.ndarray) -> np.ndarray:
     value = np.asarray(vector, dtype=np.float32)
     norm = float(np.linalg.norm(value))
@@ -198,11 +202,7 @@ def adaptive_phase_tolerance(
     frame_budget: float = 4.0,
     floor: float = 0.0025,
 ) -> float:
-    """把 phase 容差限制到约几帧，而不是 rotation 的固定百分比。
-
-    例如 39.8s / 30fps rotation 约 1195 个分析采样：4 帧约等于 phase 0.00335。
-    即使 CLI 仍传 0.04，也只把它当“最大上限”，不会再允许 ±1.6s 配对。
-    """
+    """把 phase 容差限制到约几帧，而不是 rotation 的固定百分比。"""
 
     if requested <= 0:
         raise ValueError("phase tolerance must be > 0")
@@ -218,17 +218,30 @@ def adaptive_phase_tolerance(
     return float(min(requested, max(floor, frame_phase)))
 
 
+def _transition_metrics(
+    left: SwapCandidate,
+    right: SwapCandidate,
+) -> tuple[float, float, float]:
+    return (
+        float(np.dot(left.signature, right.signature)),
+        float(np.dot(left.pre_state, right.pre_state)),
+        float(np.dot(left.post_state, right.post_state)),
+    )
+
+
 def _transition_compatibility(
     left: SwapCandidate,
     right: SwapCandidate,
 ) -> tuple[float, float, float, float]:
-    signature_similarity = float(np.dot(left.signature, right.signature))
-    pre_similarity = float(np.dot(left.pre_state, right.pre_state))
-    post_similarity = float(np.dot(left.post_state, right.post_state))
+    signature_similarity, pre_similarity, post_similarity = _transition_metrics(
+        left, right
+    )
 
-    # Directional transition 必须大体一致；同时要求转场前/后 HUD 状态各自相似。
-    # 阈值故意不是极高，保留压缩/特效噪声，但会排除“只是 phase 接近”的随机变化。
-    if signature_similarity < 0.20 or pre_similarity < 0.52 or post_similarity < 0.52:
+    if (
+        signature_similarity < SIGNATURE_SIMILARITY_MIN
+        or pre_similarity < STATE_SIMILARITY_MIN
+        or post_similarity < STATE_SIMILARITY_MIN
+    ):
         return -1.0, signature_similarity, pre_similarity, post_similarity
 
     compatibility = (
@@ -237,6 +250,157 @@ def _transition_compatibility(
         + 0.25 * np.clip((post_similarity - 0.40) / 0.60, 0.0, 1.0)
     )
     return float(compatibility), signature_similarity, pre_similarity, post_similarity
+
+
+def _distribution(values: list[float], multiplier: float | None = None) -> dict | None:
+    if not values:
+        return None
+    data = np.asarray(values, dtype=np.float32)
+    if multiplier is not None:
+        data = data * float(multiplier)
+    p10, p50, p90 = np.percentile(data, [10, 50, 90])
+    return {
+        "p10": round(float(p10), 6 if multiplier is None else 2),
+        "median": round(float(p50), 6 if multiplier is None else 2),
+        "p90": round(float(p90), 6 if multiplier is None else 2),
+    }
+
+
+def swap_matching_diagnostics(
+    candidates: list[SwapCandidate],
+    boundaries: list[int],
+    *,
+    phase_tolerance: float = 0.04,
+    period_ms: float | None = None,
+) -> dict:
+    """解释 recurring grouping 为什么通过或失败，但不改变任何匹配阈值。
+
+    统计跨 rotation 候选对分别通过 phase gate、HUD identity gate、两者交集的数量。
+    另外对每个 candidate -> 其它 loop 找最近的 identity-compatible 候选，给出其
+    phase drift 分布。这样真实视频归零时可以区分“phase 太窄”与“HUD 特征不稳定”。
+    """
+
+    effective_tolerance = adaptive_phase_tolerance(boundaries, phase_tolerance)
+    mapped = _map_to_loops(candidates, boundaries)
+    loop_count = max(0, len(boundaries) - 1)
+
+    cross_loop_pairs = 0
+    phase_near_pairs = 0
+    identity_compatible_pairs = 0
+    phase_and_identity_pairs = 0
+    failures = {
+        "signature": 0,
+        "pre_state": 0,
+        "post_state": 0,
+        "any_identity_gate": 0,
+    }
+    identity_phase_distances: list[float] = []
+
+    for left_index in range(len(mapped)):
+        left_candidate, left_loop, left_phase = mapped[left_index]
+        for right_index in range(left_index + 1, len(mapped)):
+            right_candidate, right_loop, right_phase = mapped[right_index]
+            if left_loop == right_loop:
+                continue
+            cross_loop_pairs += 1
+            phase_distance = circular_phase_distance(left_phase, right_phase)
+            signature_similarity, pre_similarity, post_similarity = _transition_metrics(
+                left_candidate, right_candidate
+            )
+            phase_ok = phase_distance <= effective_tolerance
+            identity_ok = bool(
+                signature_similarity >= SIGNATURE_SIMILARITY_MIN
+                and pre_similarity >= STATE_SIMILARITY_MIN
+                and post_similarity >= STATE_SIMILARITY_MIN
+            )
+
+            if phase_ok:
+                phase_near_pairs += 1
+                failed = False
+                if signature_similarity < SIGNATURE_SIMILARITY_MIN:
+                    failures["signature"] += 1
+                    failed = True
+                if pre_similarity < STATE_SIMILARITY_MIN:
+                    failures["pre_state"] += 1
+                    failed = True
+                if post_similarity < STATE_SIMILARITY_MIN:
+                    failures["post_state"] += 1
+                    failed = True
+                if failed:
+                    failures["any_identity_gate"] += 1
+            if identity_ok:
+                identity_compatible_pairs += 1
+                identity_phase_distances.append(phase_distance)
+            if phase_ok and identity_ok:
+                phase_and_identity_pairs += 1
+
+    nearest_identity_distances: list[float] = []
+    for seed_candidate, seed_loop, seed_phase in mapped:
+        for other_loop in range(loop_count):
+            if other_loop == seed_loop:
+                continue
+            distances = []
+            for candidate, candidate_loop, candidate_phase in mapped:
+                if candidate_loop != other_loop:
+                    continue
+                compatibility, *_ = _transition_compatibility(seed_candidate, candidate)
+                if compatibility < 0:
+                    continue
+                distances.append(circular_phase_distance(seed_phase, candidate_phase))
+            if distances:
+                nearest_identity_distances.append(min(distances))
+
+    phase_tolerance_ms = (
+        float(effective_tolerance * period_ms)
+        if period_ms is not None
+        else None
+    )
+    nearest_phase = _distribution(nearest_identity_distances)
+    nearest_ms = (
+        _distribution(nearest_identity_distances, multiplier=period_ms)
+        if period_ms is not None
+        else None
+    )
+    all_identity_phase = _distribution(identity_phase_distances)
+    all_identity_ms = (
+        _distribution(identity_phase_distances, multiplier=period_ms)
+        if period_ms is not None
+        else None
+    )
+
+    if phase_and_identity_pairs > 0:
+        hint = "phase_and_identity_overlap_exists"
+    elif identity_compatible_pairs > 0:
+        hint = "phase_gate_likely_too_tight_or_loop_boundaries_drift"
+    elif phase_near_pairs > 0:
+        hint = "hud_identity_gate_or_feature_instability"
+    elif cross_loop_pairs > 0:
+        hint = "no_cross_loop_phase_overlap_with_current_tolerance"
+    else:
+        hint = "insufficient_cross_loop_candidates"
+
+    return {
+        "cross_loop_pairs": cross_loop_pairs,
+        "phase_near_pairs": phase_near_pairs,
+        "identity_compatible_pairs": identity_compatible_pairs,
+        "phase_and_identity_pairs": phase_and_identity_pairs,
+        "effective_phase_tolerance": round(float(effective_tolerance), 6),
+        "phase_tolerance_ms": round(phase_tolerance_ms, 2) if phase_tolerance_ms is not None else None,
+        "phase_near_identity_gate_failures": failures,
+        "identity_compatible_phase_distance": {
+            "all_pairs_phase": all_identity_phase,
+            "all_pairs_ms": all_identity_ms,
+            "nearest_other_loop_phase": nearest_phase,
+            "nearest_other_loop_ms": nearest_ms,
+            "nearest_other_loop_count": len(nearest_identity_distances),
+        },
+        "hint": hint,
+        "notes": [
+            "Diagnostics are observational only; they do not relax swap matching thresholds.",
+            "Gate-failure counters are non-exclusive: one phase-near pair may fail multiple HUD identity gates.",
+            "nearest_other_loop measures the closest identity-compatible candidate in each other rotation for each seed candidate.",
+        ],
+    }
 
 
 def recurring_swap_groups(
@@ -277,7 +441,6 @@ def recurring_swap_groups(
                 )
                 if compatibility < 0:
                     continue
-                # 先按 phase，再用 HUD transition identity / candidate quality 破平。
                 rank = (
                     phase_distance / max(effective_tolerance, 1e-6)
                     - 0.30 * compatibility
@@ -409,12 +572,7 @@ def build_swap_payloads(
     analysis_right: int | None = None,
     phase_tolerance: float = 0.04,
 ) -> tuple[dict, dict]:
-    """生成 swaps.json / swap_windows.json 的可序列化 payload。
-
-    swaps.json 保留 recurring 候选；swap_windows.json 只收真正窄且 HUD identity 一致
-    的 strong visual-success windows。这样宽到几百毫秒/秒级的 recurring HUD 变化
-    不会再被冒充成严格切人窗口。
-    """
+    """生成 swaps.json / swap_windows.json 的可序列化 payload。"""
 
     loop_count = max(0, len(boundaries) - 1)
     period_ms = None
@@ -448,11 +606,17 @@ def build_swap_payloads(
         boundaries,
         phase_tolerance=phase_tolerance,
     )
+    matching_diagnostics = swap_matching_diagnostics(
+        candidates,
+        boundaries,
+        phase_tolerance=phase_tolerance,
+        period_ms=period_ms,
+    )
+    matching_diagnostics["recurring_group_count"] = len(groups)
 
     swaps = []
     windows = []
     frame_ms = 1000.0 / max(float(source_fps), 1e-6)
-    # strong 的时间离散必须是“几帧级”：30fps 时 6 帧≈200ms；60fps 时至少 140ms。
     strong_spread_limit_ms = max(frame_ms * 6.0, 140.0)
 
     for transition_index, group in enumerate(groups, start=1):
@@ -591,7 +755,7 @@ def build_swap_payloads(
             })
 
     swaps_payload = {
-        "schema": 2,
+        "schema": 3,
         "detector": "video-only recurring party-HUD transition",
         "loop_count": loop_count,
         "loop_period_ms": round(period_ms, 2) if period_ms is not None else None,
@@ -602,11 +766,13 @@ def build_swap_payloads(
         "candidate_count": len(candidates),
         "recurring_transition_count": len(swaps),
         "strong_transition_count": sum(row["status"] == "strong" for row in swaps),
+        "matching_diagnostics": matching_diagnostics,
         "transitions": swaps,
         "notes": [
             "No self telemetry is used to decide swap timing.",
             "requested phase tolerance is an upper bound; actual cross-loop matching is reduced to a few-frame adaptive tolerance.",
             "Cross-loop matches must agree in transition signature and in both pre/post HUD state, not only in rotation phase.",
+            "matching_diagnostics is observational and does not alter detector thresholds.",
             "Wide recurring HUD changes stay in swaps.json but do not enter swap_windows.json.",
             "Anonymous HUD transitions are not mapped to s1/s2/s3 until target slot evidence is reliable.",
         ],

@@ -4,7 +4,7 @@
 
 - local_event_signatures：只看事件前后相邻 analysis sample，服务 visual cluster / recurrence；
 - semantic_event_signatures：使用 -60ms 到 +40..220ms 的长视界，服务 telemetry prototype 分类；
-- semantic_timeline_guard：语义标签明显退化时 fail closed，禁止生成可编译 timeline。
+- semantic_timeline_guard：语义证据缺失或明显退化时 fail closed，禁止生成可编译 timeline。
 
 本模块不依赖 OpenCV，便于轻量 CI 覆盖关键安全逻辑。
 """
@@ -46,12 +46,7 @@ def local_event_signatures(
     ability: np.ndarray,
     indexes: list[int],
 ) -> np.ndarray:
-    """构造 visual clustering 用的短视界签名。
-
-    每个候选只比较前后 1 个 analysis sample。这个表示刻意保持局部，避免
-    semantic classifier 为匹配 telemetry 而扩大时间视界后，反过来改变
-    visual cluster / recurrence 的结构定义。
-    """
+    """构造 visual clustering 用的短视界签名。"""
 
     count = len(body)
     dimension = _dimension(body, party, ability)
@@ -88,11 +83,7 @@ def semantic_event_signatures(
     before_ms: float = DEFAULT_SEMANTIC_BEFORE_MS,
     after_offsets_ms: tuple[float, ...] = DEFAULT_SEMANTIC_AFTER_OFFSETS_MS,
 ) -> np.ndarray:
-    """构造 telemetry prototype 分类用的长视界签名。
-
-    与 prototype 构建保持一致：before 取事件前约 60ms；after 在 40..220ms
-    候选中选择原始变化量最大的一帧。这里只服务动作语义，不参与 visual cluster。
-    """
+    """构造 telemetry prototype 分类用的长视界签名。"""
 
     if analysis_fps <= 0:
         raise ValueError("analysis_fps must be > 0")
@@ -149,14 +140,18 @@ def semantic_timeline_guard(
     min_events: int = 8,
     max_dominant_share: float = 0.85,
 ) -> str | None:
-    """检测语义标签退化；命中时返回阻断原因，否则返回 None。
+    """检测语义证据缺失/退化；命中时返回阻断原因，否则返回 None。
 
-    当足够多的语义事件里绝大多数都被判成同一 token，通常意味着 prototype
-    失衡或分类器退化，而不是高手轴真的只有一种动作。命中后调用方应保留
-    analysis/review/loops，但把可编译 timeline 写空。
+    0 个语义标签也必须 fail closed。它常见于 prototype bank 为空、只有单一类别，
+    或分类器拒识全部候选；此时写出“timeline_blocked: no”会误导离线分析。
     """
 
     cleaned = [str(label) for label in labels if label]
+    if not cleaned:
+        return (
+            "没有可用的语义事件（可能是原型库为空/只有单一类别，或分类器拒识全部候选）。"
+            "已阻止生成可编译 timeline；结构、swap 与 review 分析仍保留。"
+        )
     if len(cleaned) < max(1, int(min_events)):
         return None
 

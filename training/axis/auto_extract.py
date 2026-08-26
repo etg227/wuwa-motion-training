@@ -5,8 +5,9 @@
 - semantic signature（-60ms → +40..220ms）只用于 telemetry prototype 分类；
 - party HUD transition 只依赖 UP 视频自身，用 rotation recurrence 找严格切人窗口。
 
-语义标签退化时仍保存 analysis/review/loops/swaps，但 auto_axis_timeline fail-closed 写空。
-swap_windows 也只描述“画面上成功切人”的 recurring visual window，不声称恢复真实按键时刻。
+语义证据缺失或标签退化时仍保存 analysis/review/loops/swaps，但 auto_axis_timeline
+fail-closed 写空。swap_windows 也只描述“画面上成功切人”的 recurring visual window，
+不声称恢复真实按键时刻。
 """
 
 from __future__ import annotations
@@ -104,6 +105,45 @@ def _build_review(events: list[dict], semantic_threshold: float, max_review: int
     return core._merge_review_windows(
         review_items, max_items=max(1, int(max_review))
     )
+
+
+def _print_swap_matching_diagnostics(swaps_payload: dict) -> None:
+    diagnostics = swaps_payload.get("matching_diagnostics") or {}
+    if not diagnostics:
+        return
+    print(
+        "  swap matching: "
+        f"cross-loop pairs={diagnostics.get('cross_loop_pairs', 0)} "
+        f"phase-near={diagnostics.get('phase_near_pairs', 0)} "
+        f"identity-compatible={diagnostics.get('identity_compatible_pairs', 0)} "
+        f"both={diagnostics.get('phase_and_identity_pairs', 0)}"
+    )
+    tolerance_ms = diagnostics.get("phase_tolerance_ms")
+    drift = (
+        diagnostics.get("identity_compatible_phase_distance", {})
+        .get("nearest_other_loop_ms")
+    )
+    if tolerance_ms is not None:
+        if drift:
+            print(
+                f"  phase gate≈{float(tolerance_ms):.1f}ms; nearest identity-compatible drift "
+                f"p10/median/p90≈{drift['p10']:.1f}/{drift['median']:.1f}/{drift['p90']:.1f}ms"
+            )
+        else:
+            print(
+                f"  phase gate≈{float(tolerance_ms):.1f}ms; "
+                "no identity-compatible cross-loop neighbor found"
+            )
+    failures = diagnostics.get("phase_near_identity_gate_failures") or {}
+    if diagnostics.get("phase_near_pairs", 0):
+        print(
+            "  phase-near HUD gate failures: "
+            f"signature={failures.get('signature', 0)} "
+            f"pre={failures.get('pre_state', 0)} "
+            f"post={failures.get('post_state', 0)} "
+            f"any={failures.get('any_identity_gate', 0)}"
+        )
+    print(f"  diagnostic hint={diagnostics.get('hint')}")
 
 
 def main() -> int:
@@ -304,6 +344,7 @@ def main() -> int:
         f"recurring transitions={swaps_payload['recurring_transition_count']} "
         f"strong windows={swaps_payload['strong_transition_count']}"
     )
+    _print_swap_matching_diagnostics(swaps_payload)
     if swaps_payload["strong_transition_count"]:
         for row in swaps_payload["transitions"]:
             if row["status"] != "strong":
@@ -360,7 +401,7 @@ def main() -> int:
     )
 
     analysis_payload = {
-        "schema": 3,
+        "schema": 4,
         "video": str(video),
         "source_fps": sampled.source_fps,
         "analysis_fps": sampled.analysis_fps,
@@ -378,6 +419,7 @@ def main() -> int:
             "recurring_transition_count": swaps_payload["recurring_transition_count"],
             "strong_transition_count": swaps_payload["strong_transition_count"],
             "swap_windows_execution_ready": False,
+            "matching_diagnostics": swaps_payload.get("matching_diagnostics"),
         },
         "events": events,
         "review_count": len(review),
@@ -388,8 +430,9 @@ def main() -> int:
             "30fps source has about 33.3ms visual-frame quantization; the extractor does not invent missing source frames.",
             "Self telemetry prototypes teach visual semantics only; expert timing comes from the UP video and recurrence alignment.",
             "Video-only swap timing does not use self telemetry and is aligned by recurring team-rotation phase.",
+            "swap matching diagnostics are observational only and never relax detector thresholds.",
             "swap_windows are visual-success windows, not hidden key-down timestamps and not yet outgoing-action phase.",
-            "Degenerate semantic labels fail closed: analysis is preserved but the compileable timeline is written empty.",
+            "Missing or degenerate semantic labels fail closed: analysis is preserved but the compileable timeline is written empty.",
         ],
         "warnings": [
             line for line in (timeline_blocked_reason,) if line

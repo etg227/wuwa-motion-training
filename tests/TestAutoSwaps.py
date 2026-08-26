@@ -13,6 +13,7 @@ from auto_swaps import (
     circular_phase_distance,
     detect_party_transitions,
     recurring_swap_groups,
+    swap_matching_diagnostics,
 )
 
 
@@ -87,7 +88,6 @@ class TestAutoSwaps(unittest.TestCase):
         party, ability, boundaries, fps = self._synthetic()
         rng = np.random.default_rng(99)
         transient = _normalize(rng.normal(size=party.shape[1]))
-        # 只污染第一轮 phase≈0.35；其它轮没有对应 transition。
         party[410:430] = transient
         candidates = detect_party_transitions(party, ability, fps)
         groups = recurring_swap_groups(candidates, boundaries)
@@ -124,6 +124,53 @@ class TestAutoSwaps(unittest.TestCase):
                 basis[8 + loop],
             ))
         self.assertEqual(recurring_swap_groups(candidates, boundaries), [])
+
+    def test_diagnostics_separates_tight_phase_from_stable_identity(self):
+        boundaries = [0, 1200, 2400, 3600, 4800]
+        signature = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        pre = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        post = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        phases = [0.200, 0.210, 0.220, 0.230]
+        candidates = [
+            self._candidate(loop * 1200 + int(phase * 1200), signature, pre, post)
+            for loop, phase in enumerate(phases)
+        ]
+        diagnostics = swap_matching_diagnostics(
+            candidates, boundaries, period_ms=40000.0
+        )
+        self.assertEqual(diagnostics["cross_loop_pairs"], 6)
+        self.assertEqual(diagnostics["phase_near_pairs"], 0)
+        self.assertEqual(diagnostics["identity_compatible_pairs"], 6)
+        self.assertEqual(diagnostics["phase_and_identity_pairs"], 0)
+        self.assertEqual(
+            diagnostics["hint"],
+            "phase_gate_likely_too_tight_or_loop_boundaries_drift",
+        )
+        nearest = diagnostics["identity_compatible_phase_distance"]["nearest_other_loop_ms"]
+        self.assertIsNotNone(nearest)
+        self.assertGreater(nearest["median"], diagnostics["phase_tolerance_ms"])
+
+    def test_diagnostics_separates_identity_failure_from_phase_overlap(self):
+        boundaries = [0, 1200, 2400, 3600, 4800]
+        basis = np.eye(12, dtype=np.float32)
+        candidates = [
+            self._candidate(
+                loop * 1200 + 600,
+                basis[loop],
+                basis[4 + loop],
+                basis[8 + loop],
+            )
+            for loop in range(4)
+        ]
+        diagnostics = swap_matching_diagnostics(candidates, boundaries)
+        self.assertEqual(diagnostics["phase_near_pairs"], 6)
+        self.assertEqual(diagnostics["identity_compatible_pairs"], 0)
+        self.assertEqual(diagnostics["phase_and_identity_pairs"], 0)
+        self.assertEqual(
+            diagnostics["hint"], "hud_identity_gate_or_feature_instability"
+        )
+        failures = diagnostics["phase_near_identity_gate_failures"]
+        self.assertEqual(failures["any_identity_gate"], 6)
 
     def test_build_payload_attaches_recurring_outgoing_cluster(self):
         party, ability, boundaries, fps = self._synthetic()
@@ -163,6 +210,9 @@ class TestAutoSwaps(unittest.TestCase):
         )
         self.assertTrue(all(row["execution_ready"] is False for row in windows["windows"]))
         self.assertTrue(all(row["visual_spread_ms"] >= 33.3 for row in swaps["transitions"]))
+        diagnostics = swaps["matching_diagnostics"]
+        self.assertGreater(diagnostics["phase_and_identity_pairs"], 0)
+        self.assertEqual(diagnostics["recurring_group_count"], 3)
 
     def test_invalid_fps_rejected(self):
         party = np.zeros((12, 4), dtype=np.float32)
