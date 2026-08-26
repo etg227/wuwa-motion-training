@@ -3,11 +3,12 @@
 同一遍视频扫描同时保留三条互不污染的数据线：
 - local signature（±1 analysis sample）只用于 visual clustering / recurrence；
 - semantic signature（-60ms → +40..220ms）只用于 telemetry prototype 分类；
-- party HUD transition 只依赖 UP 视频自身，用 rotation recurrence 找严格切人窗口。
+- swap 先找 party HUD transition，再以 recurring outgoing cluster + local gap + 三槽 HUD
+  change profile 跨 loop 对齐；40s rotation phase 只做粗诊断，不再承担 strict timing。
 
 语义证据缺失或标签退化时仍保存 analysis/review/loops/swaps，但 auto_axis_timeline
-fail-closed 写空。swap_windows 也只描述“画面上成功切人”的 recurring visual window，
-不声称恢复真实按键时刻。
+fail-closed 写空。swap_windows 只描述“相对局部视觉锚点的成功切人窗口”，不声称恢复
+UP 主隐藏的物理按键时刻。
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from auto_events import (
     semantic_event_signatures,
     semantic_timeline_guard,
 )
-from auto_swaps import build_swap_payloads
+from auto_swap_anchors import build_swap_payloads
 
 
 def _json_dump(path: Path, payload) -> None:
@@ -111,6 +112,36 @@ def _print_swap_matching_diagnostics(swaps_payload: dict) -> None:
     diagnostics = swaps_payload.get("matching_diagnostics") or {}
     if not diagnostics:
         return
+
+    if diagnostics.get("matching_basis", "").startswith("recurring-outgoing-cluster"):
+        print(
+            "  local-anchor matching: "
+            f"anchored={diagnostics.get('anchored_candidate_count', 0)}/"
+            f"{diagnostics.get('raw_candidate_count', 0)} "
+            f"anchors={diagnostics.get('anchor_cluster_count', 0)} "
+            f"anchors>=support={diagnostics.get('anchor_clusters_with_required_loop_support', 0)}"
+        )
+        print(
+            "  cross-loop local pairs: "
+            f"same-anchor={diagnostics.get('same_anchor_pairs', 0)} "
+            f"gap-near={diagnostics.get('local_gap_near_pairs', 0)} "
+            f"slot-profile-compatible={diagnostics.get('slot_profile_compatible_pairs', 0)} "
+            f"both={diagnostics.get('local_gap_and_profile_pairs', 0)}"
+        )
+        print(
+            f"  local gap gate≈{float(diagnostics.get('local_gap_tolerance_ms', 0.0)):.1f}ms; "
+            f"slot profile sim>={float(diagnostics.get('slot_profile_similarity_min', 0.0)):.2f}; "
+            f"coarse rotation gate={float(diagnostics.get('coarse_rotation_phase_tolerance', 0.0)):.3f}"
+        )
+        gap_fail = diagnostics.get("failed_same_anchor_gap_distance_ms")
+        if gap_fail:
+            print(
+                "  failed same-anchor gap drift p10/median/p90≈"
+                f"{gap_fail['p10']:.1f}/{gap_fail['median']:.1f}/{gap_fail['p90']:.1f}ms"
+            )
+        print(f"  diagnostic hint={diagnostics.get('hint')}")
+        return
+
     print(
         "  swap matching: "
         f"cross-loop pairs={diagnostics.get('cross_loop_pairs', 0)} "
@@ -174,7 +205,7 @@ def main() -> int:
         "--swap-phase-tolerance",
         type=float,
         default=0.04,
-        help="rotation phase tolerance used to merge recurring party-HUD transitions",
+        help="coarse whole-rotation guard only; strict swap timing uses local recurring anchors",
     )
     args = parser.parse_args()
 
@@ -247,7 +278,8 @@ def main() -> int:
     )
     print(
         "  signature scopes: visual=local ±1 sample; "
-        "semantic=-60ms -> +40..220ms; swap=party-HUD step transition"
+        "semantic=-60ms -> +40..220ms; "
+        "swap=recurring local anchor + 3-slot HUD change profile"
     )
 
     print("[3/6] build optional self-telemetry semantic prototypes")
@@ -325,7 +357,7 @@ def main() -> int:
 
     template = core._loop_template(events, boundaries)
 
-    print("[4/6] detect video-only recurring swap transitions")
+    print("[4/6] detect local-anchor recurring swap transitions")
     swaps_payload, swap_windows_payload = build_swap_payloads(
         sampled.party,
         sampled.ability,
@@ -341,6 +373,7 @@ def main() -> int:
     )
     print(
         f"  party-HUD candidates={swaps_payload['candidate_count']} "
+        f"anchored={swaps_payload.get('anchored_candidate_count', 0)} "
         f"recurring transitions={swaps_payload['recurring_transition_count']} "
         f"strong windows={swaps_payload['strong_transition_count']}"
     )
@@ -349,12 +382,15 @@ def main() -> int:
         for row in swaps_payload["transitions"]:
             if row["status"] != "strong":
                 continue
+            gap = row.get("outgoing_gap_ms") or {}
             print(
-                f"    swap#{row['transition']} phase≈{row['rotation_phase_median']:.4f} "
+                f"    swap#{row['transition']} anchor_cluster={row['outgoing_cluster']} "
+                f"gap≈{float(gap.get('median', 0.0)):.1f}ms "
                 f"support={row['support_loops']}/{row['loop_count']} "
-                f"spread≈{row['visual_spread_ms']:.1f}ms "
-                f"conf={row['confidence']:.2f} "
-                f"out_cluster={row['outgoing_cluster']}"
+                f"local_spread≈{row['local_visual_spread_ms']:.1f}ms "
+                f"rotation_spread≈{row['rotation_spread_ms']:.1f}ms "
+                f"slot_sim={row['slot_profile_consistency']:.2f} "
+                f"conf={row['confidence']:.2f}"
             )
 
     print("[5/6] write analysis / review / timeline")
@@ -401,7 +437,7 @@ def main() -> int:
     )
 
     analysis_payload = {
-        "schema": 4,
+        "schema": 5,
         "video": str(video),
         "source_fps": sampled.source_fps,
         "analysis_fps": sampled.analysis_fps,
@@ -411,11 +447,12 @@ def main() -> int:
         "signature_scopes": {
             "visual_cluster": "local ±1 analysis sample",
             "semantic_classifier": "-60ms before, best +40..220ms after",
-            "swap_detector": "party-HUD step transition + cross-loop rotation phase recurrence",
+            "swap_detector": "recurring outgoing cluster + anchor gap + three-slot party-HUD change profile",
         },
         "loop": loop_payload,
         "swap_summary": {
             "candidate_count": swaps_payload["candidate_count"],
+            "anchored_candidate_count": swaps_payload.get("anchored_candidate_count", 0),
             "recurring_transition_count": swaps_payload["recurring_transition_count"],
             "strong_transition_count": swaps_payload["strong_transition_count"],
             "swap_windows_execution_ready": False,
@@ -428,10 +465,10 @@ def main() -> int:
         "timeline_blocked_reason": timeline_blocked_reason,
         "notes": [
             "30fps source has about 33.3ms visual-frame quantization; the extractor does not invent missing source frames.",
-            "Self telemetry prototypes teach visual semantics only; expert timing comes from the UP video and recurrence alignment.",
-            "Video-only swap timing does not use self telemetry and is aligned by recurring team-rotation phase.",
-            "swap matching diagnostics are observational only and never relax detector thresholds.",
-            "swap_windows are visual-success windows, not hidden key-down timestamps and not yet outgoing-action phase.",
+            "Self telemetry prototypes teach visual semantics only; expert timing comes from the UP video.",
+            "Strict swap matching now uses a recurring local outgoing cluster and anchor-to-swap gap; whole-rotation phase is diagnostic only.",
+            "The party descriptor is split into three vertical HUD bands to compare which slot regions change, without assuming a target slot.",
+            "swap_windows are visual-success windows, not hidden key-down timestamps and not yet semantic outgoing-action phase.",
             "Missing or degenerate semantic labels fail closed: analysis is preserved but the compileable timeline is written empty.",
         ],
         "warnings": [
@@ -452,6 +489,7 @@ def main() -> int:
         f"recurring_candidates: {high_recurrence}",
         f"semantic_candidates: {semantic_events}",
         f"swap_hud_candidates: {swaps_payload['candidate_count']}",
+        f"swap_anchored_candidates: {swaps_payload.get('anchored_candidate_count', 0)}",
         f"recurring_swap_transitions: {swaps_payload['recurring_transition_count']}",
         f"strong_swap_windows: {swaps_payload['strong_transition_count']}",
         "swap_windows_execution_ready: no",
@@ -469,7 +507,7 @@ def main() -> int:
         f"  {review_path}",
         f"  {timeline_path}",
         "",
-        "swap_windows 是 video-only 的成功切人视觉窗口；当前只用于离线研究，不直接驱动 launcher。",
+        "swap_windows 是 video-only 的局部锚点→成功切人视觉窗口；当前只用于离线研究，不直接驱动 launcher。",
     ]
     if timeline_blocked_reason:
         report_lines.extend([

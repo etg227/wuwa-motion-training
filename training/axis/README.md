@@ -27,10 +27,11 @@ py -3.12 training/axis/auto_extract.py `
 1. 扫描主体、右侧队伍 HUD、右下技能 HUD 的视觉变化；
 2. 自动找动作边界候选并聚成 recurring visual clusters；
 3. 自动寻找重复 team rotation，并把不同循环中相同 phase 的事件互相对齐；
-4. **只靠 UP 视频自身**检测右侧队伍 HUD 的 step-like 转场，并把跨循环重复的转场整理成 swap visual windows；
-5. 如果本机已有 `training_data/motion/**/auto_*.mp4 + *.inputs.jsonl`，自动把 telemetry 当弱监督，只学习视觉语义原型；
-6. 高置信度事件才写进可编译 timeline；不能确定的事件保持 unknown，不强行猜成 A/E/Q/R；
-7. 只把重要、低置信度的少量片段放入 review 清单。
+4. **只靠 UP 视频自身**检测右侧队伍 HUD 的 step-like 转场；严格切人不再只靠 40 秒 rotation phase，而是优先绑定最近 recurring visual cluster，用 `anchor → swap` 的局部 gap 跨循环对齐；
+5. 把原 party HUD 特征按垂直方向拆成 3 个槽位 band，比较三槽 change profile，避免把整块 HUD 的血量/协奏/buff 变化当成同一个切人身份；
+6. 如果本机已有 `training_data/motion/**/auto_*.mp4 + *.inputs.jsonl`，自动把 telemetry 当弱监督，只学习视觉语义原型；
+7. 高置信度事件才写进可编译 timeline；不能确定的事件保持 unknown，不强行猜成 A/E/Q/R；
+8. 只把重要、低置信度的少量片段放入 review 清单。
 
 默认还会在兄弟目录 `../wuwa-yg-launcher/training_data/motion/` 寻找拆库前留下的 telemetry 数据。也可以显式指定：
 
@@ -55,8 +56,8 @@ py -3.12 training/axis/auto_extract.py --video "up.mp4" --no-self-prototypes
 ```text
 up.auto_analysis.json        完整自动分析：事件、cluster、HUD 变化、置信度、语义候选
 up.loops.json                重复循环边界 + recurring event phase 模板
-up.swaps.json                video-only 队伍 HUD 转场：每轮 occurrence、rotation phase、支持度
-up.swap_windows.json         强 recurring swap 的 P10/P50/P90 视觉窗口 + outgoing cluster 锚点
+up.swaps.json                video-only 切人候选：local anchor、三槽 HUD profile、每轮 occurrence
+up.swap_windows.json         strong recurring swap：anchor→swap P10/P50/P90 局部视觉窗口
 up.review.json               只列优先复核的小片段
 up.auto_axis_timeline.json   仅高置信度且能映射到 a/e/q/r/s1/s2/s3 的事件
 up.analysis.txt              简短摘要
@@ -66,31 +67,35 @@ up.analysis.txt              简短摘要
 
 ### `swaps.json` / `swap_windows.json` 是什么
 
-这一层**不使用本机 telemetry 决定切人 timing**。检测器只利用：
+这一层**不使用本机 telemetry 决定切人 timing**。新的 strict-swap matcher 主要利用：
 
 ```text
-右侧队伍 HUD 的稳定旧状态
+UP 视频中的 recurring visual cluster
+        ↓  作为 outgoing local anchor
+相对稳定的 anchor → swap gap
+        +
+右侧 party HUD 三个垂直槽位的 change profile
         ↓
-step-like HUD 转场
-        ↓
-稳定新状态
-        ↓
-同一个 rotation 的多轮 phase 对齐
+跨 rotation 匹配同一类成功切人
 ```
 
-如果某个 HUD 转场只在一轮出现，它不会因为“看起来像切人”就进入 strong window。四轮素材默认需要至少三轮在接近的 rotation phase 出现，才会成为 strong transition。
+为什么不再把 40 秒 rotation phase 当主时间轴：高手每轮前半段动作快慢有轻微变化时，到了后半段累计漂移几百毫秒很正常。严格切人真正应该依赖的是**附近动作/视觉状态**，而不是“这一轮开始后第 17.42 秒”。rotation phase 现在只保留做粗定位和诊断。
+
+如果某个 HUD 突变没有绑定到跨循环复现的 outgoing cluster，或同 anchor 后的 gap / 三槽 change profile 在多轮之间不一致，它不会进入 strong window。四轮素材仍默认至少需要三轮支持。
 
 `swap_windows.json` 会保留：
 
-- `rotation_phase_window.p10 / median / p90`：高手视频中成功切人的视觉 phase 分布；
-- `visual_spread_ms`：跨循环离散度，并且不会小于源视频一帧的量化误差；
 - `outgoing_cluster`：切人前最近且能跨循环复现的 visual cluster；
-- `outgoing_gap_ms`：该 cluster 到切人视觉边界的 P10/P50/P90 gap；
+- `anchor_gap_window_ms.p10 / median / p90`：该 local anchor 到成功切人视觉边界的局部 gap 分布；
+- `local_visual_spread_ms`：局部 gap 的跨循环离散度，并且不会小于源视频一帧的量化误差；
+- `rotation_phase_median / rotation_spread_ms`：只作诊断，允许明显大于 local spread；
+- `slot_profile_consistency`：三个 party HUD 槽位中“哪些区域发生变化”的跨循环一致性；
+- `dominant_slot_change_mode`：仅是哪个 HUD band 变化最大，不等价于目标角色槽位；
 - `execution_ready=false`：明确表示这还不是可直接发键的时间表。
 
-当前 `from_state / to_state / target_slot` 仍保持匿名/空值，直到 HUD 状态模型有足够证据可靠区分目标槽位；不会为了生成 `s1/s2/s3` 而猜。
+当前 `from_state / to_state / target_slot` 仍保持匿名/空值。三槽 band 只是让“同一种 HUD 转场”更稳定，**不会**把变化最大的 band 直接猜成 `s1/s2/s3`。
 
-**注意：这里得到的是“画面已经成功切人”的窗口，不是 UP 主隐藏的物理 key-down 时间。** 后续还需要把 outgoing cluster 建成真正的 action phase/cancel window，再决定何时开始 request swap。
+**注意：这里得到的是“画面已经成功切人”的窗口，不是 UP 主隐藏的物理 key-down 时间。** 后续还需要把 `outgoing_cluster` 建成真正的 action phase/cancel window，再决定何时开始 request swap。
 
 ### 30fps 的意义
 
@@ -101,7 +106,7 @@ step-like HUD 转场
 - 动作顺序；
 - 大部分切人视觉边界；
 - 重复循环结构；
-- “某个高手切人发生在 outgoing action 的哪一段 / 哪个 recurring phase”。
+- “某个高手切人发生在 outgoing action 的哪一段 / 哪个 recurring local anchor 后”。
 
 后续严格切人应优先转成**视觉 phase / cancel window**，而不是声称知道 UP 主精确到 5ms 的物理按键时间。
 
@@ -156,7 +161,8 @@ py -3.12 training/axis/compile_axis.py `
 ## 当前自动提取边界
 
 - 无监督 recurring cluster 能发现“这里每轮都发生同类视觉事件”，但没有足够 telemetry / HUD 证据时不会强行命名为 E/Q/R；
-- video-only swap detector 能找到跨循环重复的队伍 HUD 转场与成功切人视觉窗口，但当前不把匿名 HUD 状态强行映射为 `s1/s2/s3`；
+- video-only swap matcher 现在优先按 recurring local anchor + 局部 gap + 三槽 HUD change profile 对齐，不再要求不同循环的绝对 rotation phase 精确重合；
+- 三槽 band 目前只是空间粗分，不是已经可靠识别 active slot 的角色状态模型，所以不会强行映射为 `s1/s2/s3`；
 - `swap_windows.json` 不是输入宏：必须经过后续 outgoing action phase/cancel-window 建模；
 - 当前 prototype 是轻量视觉弱监督，不是已经训练好的跨角色 ActionNet；后续可把自动积累的高置信度事件继续训练成模型；
 - 一次只支持一个按住中的输入，不支持“按住 W 同时按 E”这类和弦宏编译；
